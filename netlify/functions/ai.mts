@@ -5,7 +5,7 @@
  * key from Netlify's environment variables and streams the answer back.
  * Keys to set in Netlify (mark each one "Contains secret values"):
  *   GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY
- *   CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN (optional, for image generation)
+ *   CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN (image generation; also MeloTTS in tts.mts)
  * Optional model overrides, for when a provider retires a model:
  *   GROQ_MODEL (default openai/gpt-oss-120b), OPENROUTER_MODEL (default openrouter/free)
  */
@@ -102,8 +102,8 @@ const chatProxy = async (body: string) => {
   return relay(upstream);
 };
 
-// Cloudflare Workers AI (free plan: requests fail instead of billing when the
-// daily allowance runs out). Without credentials the app falls back to Pollinations.
+// Cloudflare Workers AI. On the free plan, requests fail instead of billing
+// once the daily allowance (10,000 neurons, about 170 images) is used up.
 const imageProxy = async (body: string) => {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID;
   const token = process.env.CLOUDFLARE_API_TOKEN;
@@ -128,7 +128,12 @@ const imageProxy = async (body: string) => {
   const data = await upstream.json().catch(() => null);
   const image = data?.result?.image;
   if (!upstream.ok || typeof image !== 'string') {
-    return json(upstream.status === 429 ? 429 : 502, 'The image service did not return an image.');
+    // The used-up daily allowance can arrive as 429 or as an error naming neurons or the allocation.
+    const reason = JSON.stringify(data?.errors ?? '');
+    const dailyLimit = upstream.status === 429 || /neuron|allocation|daily|limit/i.test(reason);
+    return dailyLimit
+      ? json(429, "Today's free image limit is reached.")
+      : json(502, 'The image service did not return an image.');
   }
   return new Response(JSON.stringify({ image: `data:image/jpeg;base64,${image}` }), {
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
