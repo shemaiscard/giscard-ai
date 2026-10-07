@@ -102,8 +102,16 @@ const chatProxy = async (body: string) => {
   return relay(upstream);
 };
 
+const imageResponse = (image: string) =>
+  new Response(JSON.stringify({ image }), {
+    headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+  });
+
 // Cloudflare Workers AI. On the free plan, requests fail instead of billing
 // once the daily allowance (10,000 neurons, about 170 images) is used up.
+// FLUX.1 schnell draws first. When its GPUs are busy it can take over 30 seconds
+// from Netlify (seen in October 2026), so after 15 seconds SDXL Lightning, a
+// faster model, draws instead, within Netlify's 30-second function limit.
 const imageProxy = async (body: string) => {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID;
   const token = process.env.CLOUDFLARE_API_TOKEN;
@@ -117,27 +125,41 @@ const imageProxy = async (body: string) => {
   }
   if (!prompt || prompt.length > 2048) return json(400, 'prompt must be 1 to 2048 characters.');
 
-  const upstream = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/black-forest-labs/flux-1-schnell`,
-    {
+  const run = (model: string, input: object, timeoutMs: number) =>
+    fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${model}`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt, steps: 4 }),
-    },
-  );
-  const data = await upstream.json().catch(() => null);
-  const image = data?.result?.image;
-  if (!upstream.ok || typeof image !== 'string') {
-    // The used-up daily allowance can arrive as 429 or as an error naming neurons or the allocation.
-    const reason = JSON.stringify(data?.errors ?? '');
-    const dailyLimit = upstream.status === 429 || /neuron|allocation|daily|limit/i.test(reason);
-    return dailyLimit
-      ? json(429, "Today's free image limit is reached.")
-      : json(502, 'The image service did not return an image.');
+      body: JSON.stringify(input),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  // The used-up daily allowance can arrive as 429 or as an error naming neurons or the allocation.
+  const isDailyLimit = (status: number, data: any) =>
+    status === 429 || /neuron|allocation|daily|limit/i.test(JSON.stringify(data?.errors ?? ''));
+
+  try {
+    const upstream = await run('@cf/black-forest-labs/flux-1-schnell', { prompt, steps: 4 }, 15_000);
+    const data = await upstream.json().catch(() => null);
+    const image = data?.result?.image;
+    if (upstream.ok && typeof image === 'string') return imageResponse(`data:image/jpeg;base64,${image}`);
+    if (isDailyLimit(upstream.status, data)) return json(429, "Today's free image limit is reached.");
+  } catch {
+    // Too slow or unreachable: SDXL Lightning below.
   }
-  return new Response(JSON.stringify({ image: `data:image/jpeg;base64,${image}` }), {
-    headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
-  });
+
+  try {
+    // Answers with the image file itself (JSON only for errors).
+    const upstream = await run('@cf/bytedance/stable-diffusion-xl-lightning', { prompt }, 12_000);
+    const type = upstream.headers.get('content-type') ?? '';
+    if (upstream.ok && type.startsWith('image/')) {
+      return imageResponse(`data:${type};base64,${Buffer.from(await upstream.arrayBuffer()).toString('base64')}`);
+    }
+    if (isDailyLimit(upstream.status, await upstream.json().catch(() => null))) {
+      return json(429, "Today's free image limit is reached.");
+    }
+  } catch {
+    // Both models too slow or unreachable.
+  }
+  return json(503, 'The image service is busy. Try again in a minute.');
 };
 
 export default async (req: Request) => {

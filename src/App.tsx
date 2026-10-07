@@ -735,6 +735,7 @@ export default function App() {
       });
       if (res.ok) imageSrc = (await res.json()).image ?? '';
       else if (res.status === 429) failure = "**Today's free image limit is reached.** Try again tomorrow.";
+      else if (res.status === 503) failure = 'The image service is busy right now. Try again in a minute.';
     } catch {
       // Network error: keep the generic failure message.
     }
