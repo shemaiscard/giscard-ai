@@ -1,57 +1,37 @@
-# Giscard AI — Advanced Multimodal Intelligence
+# Giscard AI
 
-**Live Demo:** [giscard-ai.netlify.app](https://giscard-ai.netlify.app/)
+A multimodal AI assistant that runs in the browser. It answers with live web search, reads documents and images, speaks its replies, creates pictures, and exports Word, PowerPoint and Excel files.
 
-A high-performance, feature-rich AI chatbot built with **React**, **Vite**, **Google Gemini**, and **Mistral AI**. Optimized for speed, versatility, API quota efficiency, and a premium user experience.
+**Live app:** [giscard-ai.netlify.app](https://giscard-ai.netlify.app/)
 
-## Key Features
+## Features
 
-- **Multi-Model Intelligence**: Switch between Mistral Small, Pixtral 12B, Gemini 2.0 Flash, and Gemini 1.5 Pro.
-- **Multi-Document Analysis**: Upload PDF, DOCX, CSV, TXT, or Image files simultaneously.
-- **Quota Guardian (Smart Extraction)**: Extracts text from PDFs/DOCX within your browser — saves up to 90% on API limits.
-- **AI Image Generation & Code Decoding**: Syntax-highlighted code blocks and vector SVG generation in chat.
-- **Progress Visibility**: Dynamic parsing overlay and simulated upload queue for large contexts.
-- **Multilingual & Maths**: Translation, math solving, and logical assistance.
-- **Export History**: Download your full chat session as a formatted text file.
-- **Theme Aware**: Dark and Light modes with a glass-morphism UI.
+- **Chat with web search:** current answers that know the user's time zone.
+- **Documents and images:** upload PDF, Word, text or image files and ask questions about them.
+- **Shortcuts:** one tap starts a guided task for documents, images, code, math, translation or summaries.
+- **Image generation:** describe a picture, then refine it with follow-ups such as "a dog too".
+- **Office files:** Word documents, PowerPoint decks and Excel sheets, generated in the browser.
+- **Math:** step-by-step solutions with formatted equations.
+- **Voice:** dictation and a natural read-aloud voice.
+- **Memory without an account:** the chat history stays in the browser.
+- Light and dark themes, on desktop and phone.
 
-## Quick Start
+## Tech stack
 
-### Deploy on Netlify (Recommended)
-1. Fork this repository and connect it to [Netlify](https://app.netlify.com).
-2. Configure Build Settings:
-   - **Build Command**: `npm run build`
-   - **Publish Directory**: `dist`
-3. Add **Environment Variables** and tick **Contains secret values** on each:
-   - `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey)
-   - `GROQ_API_KEY` from the [Groq console](https://console.groq.com/keys)
-   - `OPENROUTER_API_KEY` from [OpenRouter](https://openrouter.ai/settings/keys)
-   - `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (a token with the Workers AI permission) for images and the MeloTTS voice
-   - Optional: `ORPHEUS_VOICE` (default `hannah`) to change the read-aloud voice
-   - Optional, when a provider retires a model: `GROQ_MODEL` (default `openai/gpt-oss-120b`) and `OPENROUTER_MODEL` (default `openrouter/free`). These are not secret.
+React 19, TypeScript, Vite and Tailwind CSS 4, with Google Gemini, Groq, OpenRouter and Cloudflare Workers AI. Hosted on Netlify.
 
-> **Security:** The browser never receives these keys. The app calls `/api/*` on its own domain, and the Netlify function in `netlify/functions/ai.mts` adds the key on the server. The function only serves this site, picks the models itself (visitors cannot choose another model), and limits each visitor to 20 requests a minute. Do not give the variables a `VITE_` prefix: Vite copies those into the public JavaScript.
+## Run locally
 
-### Local Setup
-```bash
-npm install
-npx netlify-cli dev   # runs the site and the /api functions together
-npm run build         # production build
-```
-Plain `npm run dev` starts only the frontend, so chat requests fail without the functions.
+1. Install the dependencies: `npm install`
+2. Copy `.env.example` to `.env` and add your API keys.
+3. Start the app with its serverless functions: `npx netlify-cli dev`
 
-## Tech Stack
+`npm run build` writes a production build to `dist`.
 
-| Layer | Technology |
-|---|---|
-| Frontend | React 19, TypeScript, Tailwind CSS 4 |
-| Icons | Lucide React |
-| Animations | Framer Motion |
-| AI | Gemini (`@google/generative-ai`), Groq and OpenRouter through a Netlify function |
-| Images | Cloudflare Workers AI (FLUX.1 schnell) |
-| Read-aloud | Groq Orpheus, Cloudflare MeloTTS, browser voice as fallback |
-| Parsing | `pdfjs-dist`, `mammoth` |
-| Rendering | React-Markdown with GFM |
+## Research
+
+Giscard AI is the system described in the preprint *Yin-AI: A Multimodal Conversational Agent with Voice, Memory, and Document Generation* (Shema Nkindi Giscard, 2026), available on [ResearchGate](https://www.researchgate.net/publication/408097857_Yin-AI_A_Multimodal_Conversational_Agent_with_Voice_Memory_and_Document_Generation). The [`v1.0-paper`](https://github.com/shemaiscard/giscard-ai/releases/tag/v1.0-paper) release is the version the paper describes; the main branch has changed since.
 
 ## License
-SPDX-License-Identifier: Apache-2.0
+
+Apache-2.0
