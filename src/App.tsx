@@ -127,19 +127,38 @@ const detectLanguage = (text: string) =>
     : /[؀-ۿ]/.test(text) ? 'ar'
     : 'en';
 
-// Rank voices: neural voices (Edge, Windows), then Chrome's Google voices,
-// then Apple's enhanced voices. Unranked system voices tend to sound robotic.
+// Voice choice as in the paper (Section III.E): voices whose name contains
+// Google, Natural, Premium or Microsoft, preferring "UK English Female" or Aria.
+// Replies in another language use a voice for that language.
+const PREFERRED_VOICE = /Google|Natural|Premium|Microsoft/;
 const pickVoice = (voices: SpeechSynthesisVoice[], lang: string) => {
-  const score = (v: SpeechSynthesisVoice) =>
-    /natural|neural/i.test(v.name) ? 5
-      : /^google/i.test(v.name) ? 4
-      : /premium|enhanced|siri/i.test(v.name) ? 3
-      : /samantha|daniel|karen|moira|ava|allison|serena/i.test(v.name) ? 2
-      : v.localService ? 0 : 1;
-  return voices
-    .filter(v => v.lang.toLowerCase().startsWith(lang))
-    .sort((a, b) => score(b) - score(a) || Number(b.lang === 'en-US') - Number(a.lang === 'en-US'))[0];
+  const sameLang = voices.filter(v => v.lang.toLowerCase().startsWith(lang));
+  const preferred = sameLang.filter(v => PREFERRED_VOICE.test(v.name));
+  return preferred.find(v => /UK English Female|Aria|Natural/.test(v.name)) ?? preferred[0] ?? sameLang[0];
 };
+
+// Chat history in each provider's format (paper Section III.F): Gemini uses
+// {role, parts}, OpenRouter and Groq use OpenAI-style {role, content}.
+type GeminiTurn = { role: string; parts: { text: string }[] };
+type OpenAITurn = { role: string; content: string };
+function convertHistoryForProvider(history: Message[], provider: 'gemini'): GeminiTurn[];
+function convertHistoryForProvider(history: Message[], provider: 'openai'): OpenAITurn[];
+function convertHistoryForProvider(history: Message[], provider: 'gemini' | 'openai'): (GeminiTurn | OpenAITurn)[] {
+  return history.filter(m => !m.isStreaming).map(m => {
+    const content = m.type === 'file' && m.files
+      ? `[Attached Files: ${m.files.map(f => f.name).join(', ')}]\n${m.content}`
+      : m.content;
+    return provider === 'gemini'
+      ? { role: m.role === 'user' ? 'user' : 'model', parts: [{ text: content }] }
+      : { role: m.role === 'user' ? 'user' : 'assistant', content };
+  });
+}
+
+// Files the browser cannot read (PPTX, XLSX): the model gets the name and type only.
+const unreadableFileNote = (file: AttachedFile) =>
+  `\n[Attached file: ${file.name} (${file.type || 'unknown type'}). Its contents could not be read: binary parsing for this format is not supported yet.]\n`;
+
+const PROVIDER_LABEL: Record<string, string> = { gemini: 'Gemini', openrouter: 'OpenRouter', groq: 'Groq' };
 
 // Array of fallback models in strict priority order. For OpenRouter and Groq the
 // server picks the model (GROQ_MODEL / OPENROUTER_MODEL in Netlify); these ids
@@ -165,6 +184,7 @@ interface Message {
   files?: { name: string, type: string }[];
   timestamp: Date;
   isStreaming?: boolean;
+  provider?: string; // which backend answered: gemini, openrouter or groq
 }
 
 export interface AttachedFile {
@@ -273,6 +293,8 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   const [isCreateMenuOpen, setIsCreateMenuOpen] = useState(false);
+  // Shown when a backup provider answers in a chat that has images (they are not sent to it).
+  const [fallbackImageNotice, setFallbackImageNotice] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const createMenuRef = useRef<HTMLDivElement>(null);
@@ -428,8 +450,8 @@ export default function App() {
         const utterance = new SpeechSynthesisUtterance(chunk);
         utterance.lang = voice?.lang ?? lang;
         if (voice) utterance.voice = voice;
-        utterance.rate = 1;
-        utterance.pitch = 1;
+        utterance.pitch = 1.05; // as in the paper: slightly more energetic
+        utterance.rate = 1.05;
         utterance.onerror = finish;
         if (i === chunks.length - 1) utterance.onend = finish;
         synth.speak(utterance);
@@ -531,13 +553,13 @@ export default function App() {
     setFileProgress(0);
     const newFiles: AttachedFile[] = [];
     const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-    const MAX_PHOTO_SIZE = 20 * 1024 * 1024; // photos are resized before upload
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
+      // Photos are still resized before upload, so requests stay small.
       const isPhoto = file.type.startsWith('image/') && file.type !== 'image/svg+xml';
-      if (file.size > (isPhoto ? MAX_PHOTO_SIZE : MAX_FILE_SIZE)) {
-        alert(`File ${file.name} is too large. Max size is ${isPhoto ? '20' : '5'}MB.`);
+      if (file.size > MAX_FILE_SIZE) {
+        alert(`File ${file.name} is too large. Max size is 5MB.`);
         continue;
       }
 
@@ -722,17 +744,10 @@ export default function App() {
         let fullText = '';
 
         if (currentModel.type === 'gemini') {
-          const geminiHistory = messages.filter(m => !m.isStreaming).map(m => {
-             let content = m.content;
-             if (m.type === 'file' && m.files) {
-                const fileList = m.files.map(f => f.name).join(', ');
-                content = `[Attached Files: ${fileList}]\n${m.content}`;
-             }
-             return { role: m.role === 'user' ? 'user' : 'model', parts: [{ text: content }] };
-          });
-          
+          const geminiHistory = convertHistoryForProvider(messages, 'gemini');
+
           const currentParts: any[] = [{ text: userInput || "Analyze the following." }];
-          
+
           currentFiles.forEach(file => {
              if (file.extractedText) {
                 currentParts.push({ text: `\n--- Document: ${file.name} ---\n${file.extractedText}\n--- End Document ---\n` });
@@ -743,6 +758,8 @@ export default function App() {
                       mimeType: file.type
                    }
                 });
+             } else {
+                currentParts.push({ text: unreadableFileNote(file) });
              }
           });
 
@@ -768,27 +785,17 @@ export default function App() {
           // Handle Groq and OpenRouter via OpenAI Compatible Fetch
           const aiMessages: any[] = [
             { role: 'system', content: dynamicSystemInstruction },
-            ...messages.filter(m => !m.isStreaming).map(m => {
-               let content = m.content;
-               if (m.type === 'file' && m.files) {
-                  const fileList = m.files.map(f => f.name).join(', ');
-                  content = `[Attached Files: ${fileList}]\n${m.content}`;
-               }
-               return { role: m.role === 'user' ? 'user' : 'assistant', content };
-            })
+            ...convertHistoryForProvider(messages, 'openai')
           ];
 
           const currentContent: any[] = [{ type: 'text', text: userInput || "Analyze the following." }];
-          
+
+          // Images go to Gemini only (paper Section III.F); the backup providers get text.
           currentFiles.forEach(file => {
             if (file.extractedText) {
               currentContent.push({ type: 'text', text: `\n--- Document: ${file.name} ---\n${file.extractedText}\n--- End Document ---\n` });
-            } else if (file.type.startsWith('image/') && currentModel.type !== 'groq') {
-              // Groq versatile doesn't natively support image base64, OpenRouter does.
-              currentContent.push({ 
-                type: 'image_url', 
-                image_url: { url: `data:${file.type};base64,${file.data}` } 
-              });
+            } else if (!file.type.startsWith('image/')) {
+              currentContent.push({ type: 'text', text: unreadableFileNote(file) });
             }
           });
 
@@ -850,13 +857,15 @@ export default function App() {
         if (isDocGen) {
            await handleDocumentGeneration(docType, docTopic, fullText);
            setMessages(prev => prev.map(msg =>
-              msg.id === aiMessageId ? { ...msg, content: `✅ I've created the ${docType.toUpperCase()} file about "${docTopic}". It should download automatically!`, isStreaming: false } : msg
+              msg.id === aiMessageId ? { ...msg, content: `✅ I've created the ${docType.toUpperCase()} file about "${docTopic}". It should download automatically!`, isStreaming: false, provider: currentModel.type } : msg
            ));
         } else {
            setMessages(prev => prev.map(msg =>
-             msg.id === aiMessageId ? { ...msg, isStreaming: false } : msg
+             msg.id === aiMessageId ? { ...msg, isStreaming: false, provider: currentModel.type } : msg
            ));
         }
+        const sessionHasImages = [...messages.flatMap(m => m.files ?? []), ...currentFiles].some(f => f.type.startsWith('image/'));
+        setFallbackImageNotice(currentModel.type !== 'gemini' && sessionHasImages);
         success = true;
       } catch (error: any) {
         console.error(`Error with model ${currentModel.id}:`, error);
@@ -1026,6 +1035,7 @@ export default function App() {
                   <div className={`flex items-center justify-between mt-2 pt-2 border-t border-white/5 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
                     <div className={`text-[9px] opacity-40 font-mono ${msg.role === 'user' ? 'text-right' : ''}`}>
                       {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      {msg.role === 'ai' && msg.provider && <span title="AI provider that answered"> · via {PROVIDER_LABEL[msg.provider] ?? msg.provider}</span>}
                     </div>
                     {msg.role === 'ai' && !msg.isStreaming && msg.type === 'text' && (
                       <button 
@@ -1046,6 +1056,12 @@ export default function App() {
 
         {/* Input Area */}
         <div className="relative">
+          {fallbackImageNotice && !fileProgress && !isUploadingToAI && attachedFiles.length === 0 && (
+            <div role="status" className="absolute bottom-full left-0 w-full mb-2 flex items-start gap-2 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100 border border-amber-400 rounded-lg p-3 text-xs shadow-xl">
+              <span className="flex-1">A backup model answered. It cannot see images, so the images in this chat were left out of its answer.</span>
+              <button onClick={() => setFallbackImageNotice(false)} className="p-0.5 rounded hover:bg-amber-200/40" aria-label="Dismiss notice"><X size={14} /></button>
+            </div>
+          )}
           {fileProgress !== null && (
             <div className="absolute bottom-full left-0 w-full mb-2 bg-[var(--bg-secondary)] rounded-lg p-3 shadow-xl border border-[var(--primary-color)]">
               <div className="flex justify-between items-center mb-2">
@@ -1135,7 +1151,7 @@ export default function App() {
               onChange={handleFileChange}
               className="hidden"
               multiple
-              accept=".pdf,.docx,.pptx,.txt,.csv,.md,.png,.jpg,.jpeg,.svg"
+              accept=".pdf,.docx,.pptx,.xlsx,.txt,.csv,.md,.png,.jpg,.jpeg,.svg"
             />
             <textarea
               value={input}
