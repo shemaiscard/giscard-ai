@@ -100,7 +100,7 @@ export const shortcutInstruction = ({ kind, option }: ShortcutState): string => 
     case 'math':
       return option === 'Just the answer'
         ? 'Math mode is on. Give the final answer in bold with one or two lines of working. Write math in LaTeX: $...$ inline and $$...$$ on its own line.'
-        : 'Math mode is on. Solve the problem with the user step by step, like a patient tutor: number the steps, explain each one briefly, and end with the final answer in bold. Write math in LaTeX: $...$ inline and $$...$$ on its own line. If the problem is unclear, ask one short question first.';
+        : 'Math mode is on. Solve the problem with the user step by step, like a patient tutor: number the steps, explain each one briefly, and end with the final answer in bold. Write math in LaTeX: $...$ inside sentences, and put each equation you work through on its own line as $$...$$. If the problem is unclear, ask one short question first.';
     case 'translate':
       return option
         ? `Translate mode is on. Translate the user's text into ${option}. Reply with the translation only, without notes. For a language with a non-Latin script, add the pronunciation in Latin letters on a new line.`

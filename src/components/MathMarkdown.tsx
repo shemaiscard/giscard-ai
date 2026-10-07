@@ -12,7 +12,8 @@ export const normalizeMath = (text: string) =>
   text
     .replace(/\\\[([\s\S]+?)\\\]/g, (_, tex: string) => `\n$$\n${tex.trim()}\n$$\n`)
     .replace(/\\\((.+?)\\\)/g, (_, tex: string) => `$${tex.trim()}$`)
-    .replace(/^[ \t]*\$\$([^\n]+?)\$\$[ \t]*$/gm, (_, tex: string) => `$$\n${tex.trim()}\n$$`);
+    // Keep the indent, so an equation inside a numbered step stays in that step.
+    .replace(/^([ \t]*)\$\$([^\n]+?)\$\$[ \t]*$/gm, (_, indent: string, tex: string) => `${indent}$$\n${indent}${tex.trim()}\n${indent}$$`);
 
 export default function MathMarkdown({ children, components }: { children: string; components?: Components }) {
   return (
