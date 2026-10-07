@@ -26,7 +26,8 @@ A high-performance, feature-rich AI chatbot built with **React**, **Vite**, **Go
    - `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey)
    - `GROQ_API_KEY` from the [Groq console](https://console.groq.com/keys)
    - `OPENROUTER_API_KEY` from [OpenRouter](https://openrouter.ai/settings/keys)
-   - Optional, for image generation: `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (a token with the Workers AI permission)
+   - `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (a token with the Workers AI permission) for images and the MeloTTS voice
+   - Optional: `ORPHEUS_VOICE` (default `hannah`) to change the read-aloud voice
    - Optional, when a provider retires a model: `GROQ_MODEL` (default `openai/gpt-oss-120b`) and `OPENROUTER_MODEL` (default `openrouter/free`). These are not secret.
 
 > **Security:** The browser never receives these keys. The app calls `/api/*` on its own domain, and the Netlify function in `netlify/functions/ai.mts` adds the key on the server. The function only serves this site, picks the models itself (visitors cannot choose another model), and limits each visitor to 20 requests a minute. Do not give the variables a `VITE_` prefix: Vite copies those into the public JavaScript.
@@ -47,7 +48,8 @@ Plain `npm run dev` starts only the frontend, so chat requests fail without the 
 | Icons | Lucide React |
 | Animations | Framer Motion |
 | AI | Gemini (`@google/generative-ai`), Groq and OpenRouter through a Netlify function |
-| Images | Cloudflare Workers AI (FLUX.1 schnell), Pollinations as fallback |
+| Images | Cloudflare Workers AI (FLUX.1 schnell) |
+| Read-aloud | Groq Orpheus, Cloudflare MeloTTS, browser voice as fallback |
 | Parsing | `pdfjs-dist`, `mammoth` |
 | Rendering | React-Markdown with GFM |
 

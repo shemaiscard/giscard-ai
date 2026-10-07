@@ -59,10 +59,9 @@ import * as XLSX from 'xlsx';
 const ai = new GoogleGenerativeAI('server-side-key');
 const GEMINI_PROXY = { baseUrl: `${window.location.origin}/api/gemini` };
 
-// Free image service used when the server has no Cloudflare credentials.
-// Its anonymous tier refuses many requests (HTTP 402), so images retry a few times.
-const pollinationsUrl = (prompt: string) =>
-  `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${Math.floor(Math.random() * 1000000)}&nologo=true&width=1024&height=1024`;
+// A tiny silent sound played during the read-aloud tap: phones only allow audio
+// that starts from a tap, and the real voice arrives a moment later.
+const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAACAgICA';
 
 // Photos are resized before upload: smaller requests, fewer tokens, and the
 // server rejects request bodies above about 5 MB.
@@ -158,8 +157,6 @@ function convertHistoryForProvider(history: Message[], provider: 'gemini' | 'ope
 const unreadableFileNote = (file: AttachedFile) =>
   `\n[Attached file: ${file.name} (${file.type || 'unknown type'}). Its contents could not be read: binary parsing for this format is not supported yet.]\n`;
 
-const PROVIDER_LABEL: Record<string, string> = { gemini: 'Gemini', openrouter: 'OpenRouter', groq: 'Groq' };
-
 // Array of fallback models in strict priority order. For OpenRouter and Groq the
 // server picks the model (GROQ_MODEL / OPENROUTER_MODEL in Netlify); these ids
 // are the defaults, kept here for reference and logs.
@@ -184,7 +181,6 @@ interface Message {
   files?: { name: string, type: string }[];
   timestamp: Date;
   isStreaming?: boolean;
-  provider?: string; // which backend answered: gemini, openrouter or groq
 }
 
 export interface AttachedFile {
@@ -223,20 +219,10 @@ const CodeBlock = ({ children, ...props }: any) => {
 };
 
 // Square frame capped at the screen width, so a 1024 px image cannot push the
-// chat wider than the screen. Retries cover the free service's refusals.
+// chat wider than the screen.
 const GeneratedImage = ({ src, onDownload }: { src: string; onDownload: (url: string, e: React.MouseEvent) => void }) => {
   const [attempt, setAttempt] = useState(0);
   const [status, setStatus] = useState<'loading' | 'loaded' | 'failed'>('loading');
-  const isPollinations = src.startsWith('https://image.pollinations.ai/');
-  const currentSrc = isPollinations && attempt > 0 ? `${src}&retry=${attempt}` : src;
-
-  const handleError = () => {
-    if (isPollinations && attempt < 3) {
-      setTimeout(() => setAttempt(a => a + 1), 4000 * (attempt + 1));
-    } else {
-      setStatus('failed');
-    }
-  };
 
   const retry = () => {
     setAttempt(a => a + 1);
@@ -247,30 +233,30 @@ const GeneratedImage = ({ src, onDownload }: { src: string; onDownload: (url: st
     <div className="group relative w-[min(28rem,70vw)] max-w-full aspect-square rounded-xl overflow-hidden bg-black/5">
       {status !== 'failed' && (
         <img
-          key={`${currentSrc}#${attempt}`}
-          src={currentSrc}
+          key={`${src}#${attempt}`}
+          src={src}
           alt="AI generated"
           referrerPolicy="no-referrer"
           onLoad={() => setStatus('loaded')}
-          onError={handleError}
+          onError={() => setStatus('failed')}
           className={`absolute inset-0 w-full h-full object-contain transition-opacity duration-300 ${status === 'loaded' ? 'opacity-100' : 'opacity-0'}`}
         />
       )}
       {status === 'loading' && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center text-xs text-[var(--text-secondary)]">
           <Loader2 size={20} className="animate-spin text-[var(--primary-color)]" />
-          {attempt > 0 ? `Image service is busy, retrying (${attempt}/3)...` : 'Generating image...'}
+          Loading image...
         </div>
       )}
       {status === 'failed' && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 text-center text-xs text-[var(--text-secondary)]">
-          <span>The free image service is busy right now.</span>
+          <span>The image could not be loaded.</span>
           <button onClick={retry} className="px-3 py-1.5 rounded-lg bg-[var(--primary-color)] text-white font-semibold">Try again</button>
         </div>
       )}
       {status === 'loaded' && (
         <button
-          onClick={(e) => onDownload(currentSrc, e)}
+          onClick={(e) => onDownload(src, e)}
           className="absolute top-2 right-2 p-2.5 bg-black/50 text-white rounded-full opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-all hover:bg-[var(--primary-color)]"
           title="Download image"
         >
@@ -420,29 +406,34 @@ export default function App() {
     };
   }, []);
 
-  const toggleMessageTTS = (messageId: string, text: string) => {
+  // Natural voices come from the server (/api/tts: Groq Orpheus, then Cloudflare
+  // MeloTTS); the browser's own voice is the last resort. Each playback gets a
+  // number, so a cancelled playback cannot reset the button of the next one.
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const speechAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    speechAbortRef.current?.abort();
+    audioRef.current?.pause();
+  }, []);
+
+  const stopSpeech = () => {
+    speechRunRef.current++;
+    speechAbortRef.current?.abort();
+    audioRef.current?.pause();
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    setPlayingMessageId(null);
+  };
+
+  const speakWithBrowserVoice = (chunks: string[], lang: string, run: number) => {
     if (!('speechSynthesis' in window)) {
-      alert("Read aloud is not supported by your browser.");
-      return;
-    }
-    const synth = window.speechSynthesis;
-    // Each playback gets a number, so events from a cancelled playback
-    // cannot reset the button of the one that replaced it.
-    const run = ++speechRunRef.current;
-    synth.cancel();
-    if (playingMessageId === messageId) {
       setPlayingMessageId(null);
       return;
     }
-
-    const spoken = toSpeechText(text);
-    if (!spoken) return;
-    const lang = detectLanguage(spoken);
+    const synth = window.speechSynthesis;
     const voice = pickVoice(voicesRef.current.length ? voicesRef.current : synth.getVoices(), lang);
-    const chunks = splitForSpeech(spoken);
     const finish = () => { if (speechRunRef.current === run) setPlayingMessageId(null); };
-
-    setPlayingMessageId(messageId);
+    synth.cancel();
     // Chrome sometimes drops speech queued in the same tick as cancel().
     setTimeout(() => {
       if (speechRunRef.current !== run) return;
@@ -457,6 +448,77 @@ export default function App() {
         synth.speak(utterance);
       });
     }, 100);
+  };
+
+  // One part of a reply as speech from the server, or null when no voice service answers.
+  const fetchVoice = async (text: string, lang: string, engine: string | undefined, signal: AbortSignal) => {
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, lang, engine }),
+        signal,
+      });
+      if (!res.ok) return null;
+      return { url: URL.createObjectURL(await res.blob()), engine: res.headers.get('X-TTS-Engine') ?? undefined };
+    } catch {
+      return null;
+    }
+  };
+
+  const playAudio = (audio: HTMLAudioElement, url: string, signal: AbortSignal) => new Promise<boolean>(resolve => {
+    audio.onended = () => resolve(true);
+    audio.onerror = () => resolve(false);
+    signal.addEventListener('abort', () => resolve(false), { once: true });
+    audio.src = url;
+    audio.play().catch(() => resolve(false));
+  });
+
+  const toggleMessageTTS = async (messageId: string, text: string) => {
+    const wasPlaying = playingMessageId === messageId;
+    stopSpeech();
+    if (wasPlaying) return;
+
+    const spoken = toSpeechText(text);
+    if (!spoken) return;
+    const lang = detectLanguage(spoken);
+    const chunks = splitForSpeech(spoken, 190); // Orpheus takes up to 200 characters per request
+    const run = speechRunRef.current;
+    const controller = new AbortController();
+    speechAbortRef.current = controller;
+    setPlayingMessageId(messageId);
+
+    // Start audio inside the tap, so phones allow the voice that arrives a moment later.
+    const audio = audioRef.current ?? new Audio();
+    audioRef.current = audio;
+    audio.src = SILENT_WAV;
+    audio.play().catch(() => {});
+
+    let engine: string | undefined;
+    let next = fetchVoice(chunks[0], lang, engine, controller.signal);
+    for (let i = 0; i < chunks.length; i++) {
+      const voice = await next;
+      if (speechRunRef.current !== run) {
+        if (voice) URL.revokeObjectURL(voice.url);
+        return;
+      }
+      if (!voice) {
+        // Daily limits reached or offline: the browser voice reads the rest.
+        speakWithBrowserVoice(chunks.slice(i), lang, run);
+        return;
+      }
+      engine = voice.engine; // keep the same voice for the whole reply
+      // Fetch the next part while this one plays.
+      next = i + 1 < chunks.length ? fetchVoice(chunks[i + 1], lang, engine, controller.signal) : Promise.resolve(null);
+      const played = await playAudio(audio, voice.url, controller.signal);
+      URL.revokeObjectURL(voice.url);
+      if (speechRunRef.current !== run) return;
+      if (!played) {
+        speakWithBrowserVoice(chunks.slice(i), lang, run);
+        return;
+      }
+    }
+    if (speechRunRef.current === run) setPlayingMessageId(null);
   };
 
   const handleImageDownload = async (url: string, e: React.MouseEvent) => {
@@ -697,11 +759,11 @@ export default function App() {
     setMessages(prev => [...prev, initialAiMessage]);
     setIsLoading(false);
 
-    // Image generation: Cloudflare through /api/image when the server has
-    // credentials, otherwise the free Pollinations service (retried by GeneratedImage).
+    // Image generation: Cloudflare Workers AI through /api/image (no watermark).
     if (isImageGen && imagePrompt.trim() !== '') {
         const prompt = `${imagePrompt} highly detailed, masterpiece`;
         let imageSrc = '';
+        let failure = 'Image generation failed. Please try again.';
         try {
           const res = await fetch('/api/image', {
             method: 'POST',
@@ -709,13 +771,16 @@ export default function App() {
             body: JSON.stringify({ prompt }),
           });
           if (res.ok) imageSrc = (await res.json()).image ?? '';
+          else if (res.status === 429) failure = "**Today's free image limit is reached.** Try again tomorrow.";
         } catch {
-          // Fall back to Pollinations below.
+          // Network error: keep the generic failure message.
         }
 
         setMessages(prev => prev.map(msg =>
             msg.id === aiMessageId
-                ? { ...msg, type: 'image', content: imageSrc || pollinationsUrl(prompt), isStreaming: false }
+                ? (imageSrc
+                    ? { ...msg, type: 'image', content: imageSrc, isStreaming: false }
+                    : { ...msg, content: failure, isStreaming: false })
                 : msg
         ));
 
@@ -857,11 +922,11 @@ export default function App() {
         if (isDocGen) {
            await handleDocumentGeneration(docType, docTopic, fullText);
            setMessages(prev => prev.map(msg =>
-              msg.id === aiMessageId ? { ...msg, content: `✅ I've created the ${docType.toUpperCase()} file about "${docTopic}". It should download automatically!`, isStreaming: false, provider: currentModel.type } : msg
+              msg.id === aiMessageId ? { ...msg, content: `✅ I've created the ${docType.toUpperCase()} file about "${docTopic}". It should download automatically!`, isStreaming: false } : msg
            ));
         } else {
            setMessages(prev => prev.map(msg =>
-             msg.id === aiMessageId ? { ...msg, isStreaming: false, provider: currentModel.type } : msg
+             msg.id === aiMessageId ? { ...msg, isStreaming: false } : msg
            ));
         }
         const sessionHasImages = [...messages.flatMap(m => m.files ?? []), ...currentFiles].some(f => f.type.startsWith('image/'));
@@ -1035,7 +1100,6 @@ export default function App() {
                   <div className={`flex items-center justify-between mt-2 pt-2 border-t border-white/5 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
                     <div className={`text-[9px] opacity-40 font-mono ${msg.role === 'user' ? 'text-right' : ''}`}>
                       {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      {msg.role === 'ai' && msg.provider && <span title="AI provider that answered"> · via {PROVIDER_LABEL[msg.provider] ?? msg.provider}</span>}
                     </div>
                     {msg.role === 'ai' && !msg.isStreaming && msg.type === 'text' && (
                       <button 
