@@ -6,6 +6,8 @@
  * Keys to set in Netlify (mark each one "Contains secret values"):
  *   GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY
  *   CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN (optional, for image generation)
+ * Optional model overrides, for when a provider retires a model:
+ *   GROQ_MODEL (default openai/gpt-oss-120b), OPENROUTER_MODEL (default openrouter/free)
  */
 
 const MAX_BODY_BYTES = 5_500_000; // Netlify functions reject request bodies above 6 MB
@@ -13,18 +15,20 @@ const MAX_BODY_BYTES = 5_500_000; // Netlify functions reject request bodies abo
 // Only these Gemini calls may use the key: the model the app uses, chat endpoints only.
 const GEMINI_ROUTE = /^\/api\/gemini\/v1beta\/models\/gemini-2\.5-flash:(streamGenerateContent|generateContent)$/;
 
-// OpenAI-compatible providers, each limited to the model the app actually uses,
-// so a copied request cannot spend the keys on other (paid) models.
-const CHAT_PROVIDERS: Record<string, { url: string; keyName: string; models: string[] }> = {
+// OpenAI-compatible providers. The server picks the model (a Netlify variable
+// or the default), so a copied request cannot spend the keys on other (paid) models.
+const CHAT_PROVIDERS: Record<string, { url: string; keyName: string; modelName: string; defaultModel: string }> = {
   groq: {
     url: 'https://api.groq.com/openai/v1/chat/completions',
     keyName: 'GROQ_API_KEY',
-    models: ['llama-3.3-70b-versatile'],
+    modelName: 'GROQ_MODEL',
+    defaultModel: 'openai/gpt-oss-120b', // Groq retired llama-3.3-70b-versatile in 2026
   },
   openrouter: {
     url: 'https://openrouter.ai/api/v1/chat/completions',
     keyName: 'OPENROUTER_API_KEY',
-    models: ['openrouter/free'],
+    modelName: 'OPENROUTER_MODEL',
+    defaultModel: 'openrouter/free', // free models only; openrouter/auto is paid
   },
 };
 
@@ -67,19 +71,18 @@ const geminiProxy = async (path: string, url: URL, body: string) => {
 };
 
 const chatProxy = async (body: string) => {
-  let payload: { provider?: string; model?: string; messages?: unknown; temperature?: number };
+  let payload: { provider?: string; messages?: unknown; temperature?: number };
   try {
     payload = JSON.parse(body);
   } catch {
     return json(400, 'Request body must be JSON.');
   }
   const provider = CHAT_PROVIDERS[payload.provider ?? ''];
-  if (!provider || !provider.models.includes(payload.model ?? '')) {
-    return json(400, 'Unknown provider or model.');
-  }
+  if (!provider) return json(400, 'Unknown provider.');
   if (!Array.isArray(payload.messages)) return json(400, 'messages must be an array.');
   const key = process.env[provider.keyName];
   if (!key) return json(500, `${provider.keyName} is not set on the server.`);
+  const model = process.env[provider.modelName] || provider.defaultModel;
 
   const upstream = await fetch(provider.url, {
     method: 'POST',
@@ -90,7 +93,7 @@ const chatProxy = async (body: string) => {
       'X-Title': 'Giscard AI',
     },
     body: JSON.stringify({
-      model: payload.model,
+      model,
       messages: payload.messages,
       stream: true,
       temperature: Math.min(Math.max(Number(payload.temperature) || 0.5, 0), 1),

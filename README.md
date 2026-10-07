@@ -27,8 +27,9 @@ A high-performance, feature-rich AI chatbot built with **React**, **Vite**, **Go
    - `GROQ_API_KEY` from the [Groq console](https://console.groq.com/keys)
    - `OPENROUTER_API_KEY` from [OpenRouter](https://openrouter.ai/settings/keys)
    - Optional, for image generation: `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (a token with the Workers AI permission)
+   - Optional, when a provider retires a model: `GROQ_MODEL` (default `openai/gpt-oss-120b`) and `OPENROUTER_MODEL` (default `openrouter/free`). These are not secret.
 
-> **Security:** The browser never receives these keys. The app calls `/api/*` on its own domain, and the Netlify function in `netlify/functions/ai.mts` adds the key on the server. The function only serves this site, only allows the models the app uses, and limits each visitor to 20 requests a minute. Do not give the variables a `VITE_` prefix: Vite copies those into the public JavaScript.
+> **Security:** The browser never receives these keys. The app calls `/api/*` on its own domain, and the Netlify function in `netlify/functions/ai.mts` adds the key on the server. The function only serves this site, picks the models itself (visitors cannot choose another model), and limits each visitor to 20 requests a minute. Do not give the variables a `VITE_` prefix: Vite copies those into the public JavaScript.
 
 ### Local Setup
 ```bash

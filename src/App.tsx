@@ -141,11 +141,13 @@ const pickVoice = (voices: SpeechSynthesisVoice[], lang: string) => {
     .sort((a, b) => score(b) - score(a) || Number(b.lang === 'en-US') - Number(a.lang === 'en-US'))[0];
 };
 
-// Array of fallback models in strict priority order
+// Array of fallback models in strict priority order. For OpenRouter and Groq the
+// server picks the model (GROQ_MODEL / OPENROUTER_MODEL in Netlify); these ids
+// are the defaults, kept here for reference and logs.
 const FALLBACK_MODELS = [
   { id: 'gemini-2.5-flash', type: 'gemini' },
   { id: 'openrouter/free', type: 'openrouter' },
-  { id: 'llama-3.3-70b-versatile', type: 'groq' }
+  { id: 'openai/gpt-oss-120b', type: 'groq' }
 ];
 
 // System identity injected into every model
@@ -792,13 +794,12 @@ export default function App() {
 
           aiMessages.push({ role: 'user', content: currentContent });
 
-          // The server adds the Groq or OpenRouter key (netlify/functions/ai.mts).
+          // The server adds the Groq or OpenRouter key and picks the model (netlify/functions/ai.mts).
           const response = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               provider: currentModel.type,
-              model: currentModel.id,
               messages: aiMessages,
               temperature: 0.5,
             })
