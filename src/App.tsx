@@ -10,7 +10,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import localforage from 'localforage';
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, type Tool } from "@google/generative-ai";
 import {
   Send,
   Bot,
@@ -53,34 +53,92 @@ import { Document, Packer, Paragraph, TextRun } from 'docx';
 import pptxgen from 'pptxgenjs';
 import * as XLSX from 'xlsx';
 
-// Initialize Gemini API
-const getGeminiKey = () => {
-  const key = (import.meta as any).env.VITE_GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
-  if (!key || key === 'undefined') {
-    console.warn('Gemini API Key not found. Please set VITE_GEMINI_API_KEY.');
+// API keys never ship to the browser. Every AI request goes to /api/* on this
+// site, where netlify/functions/ai.mts adds the key on the server.
+// The SDK requires a key string, so it gets a placeholder; the server ignores it.
+const ai = new GoogleGenerativeAI('server-side-key');
+const GEMINI_PROXY = { baseUrl: `${window.location.origin}/api/gemini` };
+
+// Free image service used when the server has no Cloudflare credentials.
+// Its anonymous tier refuses many requests (HTTP 402), so images retry a few times.
+const pollinationsUrl = (prompt: string) =>
+  `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${Math.floor(Math.random() * 1000000)}&nologo=true&width=1024&height=1024`;
+
+// Photos are resized before upload: smaller requests, fewer tokens, and the
+// server rejects request bodies above about 5 MB.
+const shrinkImage = (file: File, maxSide = 1600): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Could not read the image.'));
+    };
+    img.src = url;
+  });
+
+// Read-aloud helpers: speak plain sentences, not Markdown symbols.
+const toSpeechText = (markdown: string) =>
+  markdown
+    .replace(/```[\s\S]*?```/g, '\nCode block omitted.\n')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, 'link')
+    .replace(/^\s*#{1,6}\s+/gm, '')
+    .replace(/^\s*(?:[-*+]|\d+\.)\s+/gm, '')
+    .replace(/\|/g, ', ')
+    .replace(/^[\s,:-]+$/gm, '')
+    .replace(/(\*\*|__|~~|\*|_)/g, '')
+    .replace(/[\p{Extended_Pictographic}\u{FE0F}]/gu, '')
+    .replace(/([^.!?:;,\s])\s*\n/g, '$1.\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+// Short chunks avoid Chrome cutting off long utterances after about 15 seconds.
+const splitForSpeech = (text: string, maxLength = 220) => {
+  const chunks: string[] = [];
+  let current = '';
+  for (const sentence of text.match(/[^.!?]+[.!?]*\s*/g) ?? [text]) {
+    if (current && (current + sentence).length > maxLength) {
+      chunks.push(current.trim());
+      current = '';
+    }
+    current += sentence;
   }
-  return key || '';
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
 };
 
-// Only initialize if key exists to prevent crashing if user hasn't set it yet
-const ai = getGeminiKey() ? new GoogleGenerativeAI(getGeminiKey()) : null;
+const detectLanguage = (text: string) =>
+  /[가-힯]/.test(text) ? 'ko'
+    : /[぀-ヿ]/.test(text) ? 'ja'
+    : /[一-鿿]/.test(text) ? 'zh'
+    : /[Ѐ-ӿ]/.test(text) ? 'ru'
+    : /[؀-ۿ]/.test(text) ? 'ar'
+    : 'en';
 
-// Initialize Groq Key
-const getGroqKey = () => {
-  const key = (import.meta as any).env.VITE_GROQ_API_KEY || process.env.VITE_GROQ_API_KEY;
-  if (!key || key === 'undefined') {
-    console.warn('Groq API Key not found. Please set VITE_GROQ_API_KEY.');
-  }
-  return key || '';
-};
-
-// Initialize OpenRouter Key
-const getOpenRouterKey = () => {
-  const key = (import.meta as any).env.VITE_OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
-  if (!key || key === 'undefined') {
-    console.warn('OpenRouter API Key not found. Please set VITE_OPENROUTER_API_KEY.');
-  }
-  return key || '';
+// Rank voices: neural voices (Edge, Windows), then Chrome's Google voices,
+// then Apple's enhanced voices. Unranked system voices tend to sound robotic.
+const pickVoice = (voices: SpeechSynthesisVoice[], lang: string) => {
+  const score = (v: SpeechSynthesisVoice) =>
+    /natural|neural/i.test(v.name) ? 5
+      : /^google/i.test(v.name) ? 4
+      : /premium|enhanced|siri/i.test(v.name) ? 3
+      : /samantha|daniel|karen|moira|ava|allison|serena/i.test(v.name) ? 2
+      : v.localService ? 0 : 1;
+  return voices
+    .filter(v => v.lang.toLowerCase().startsWith(lang))
+    .sort((a, b) => score(b) - score(a) || Number(b.lang === 'en-US') - Number(a.lang === 'en-US'))[0];
 };
 
 // Array of fallback models in strict priority order
@@ -138,6 +196,65 @@ const CodeBlock = ({ children, ...props }: any) => {
       <pre className="!bg-[#1e1e1e] !text-gray-200 !p-4 rounded-xl overflow-x-auto border border-white/5 font-mono text-sm leading-relaxed" {...props}>
         <code>{children}</code>
       </pre>
+    </div>
+  );
+};
+
+// Square frame capped at the screen width, so a 1024 px image cannot push the
+// chat wider than the screen. Retries cover the free service's refusals.
+const GeneratedImage = ({ src, onDownload }: { src: string; onDownload: (url: string, e: React.MouseEvent) => void }) => {
+  const [attempt, setAttempt] = useState(0);
+  const [status, setStatus] = useState<'loading' | 'loaded' | 'failed'>('loading');
+  const isPollinations = src.startsWith('https://image.pollinations.ai/');
+  const currentSrc = isPollinations && attempt > 0 ? `${src}&retry=${attempt}` : src;
+
+  const handleError = () => {
+    if (isPollinations && attempt < 3) {
+      setTimeout(() => setAttempt(a => a + 1), 4000 * (attempt + 1));
+    } else {
+      setStatus('failed');
+    }
+  };
+
+  const retry = () => {
+    setAttempt(a => a + 1);
+    setStatus('loading');
+  };
+
+  return (
+    <div className="group relative w-[min(28rem,70vw)] max-w-full aspect-square rounded-xl overflow-hidden bg-black/5">
+      {status !== 'failed' && (
+        <img
+          key={`${currentSrc}#${attempt}`}
+          src={currentSrc}
+          alt="AI generated"
+          referrerPolicy="no-referrer"
+          onLoad={() => setStatus('loaded')}
+          onError={handleError}
+          className={`absolute inset-0 w-full h-full object-contain transition-opacity duration-300 ${status === 'loaded' ? 'opacity-100' : 'opacity-0'}`}
+        />
+      )}
+      {status === 'loading' && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center text-xs text-[var(--text-secondary)]">
+          <Loader2 size={20} className="animate-spin text-[var(--primary-color)]" />
+          {attempt > 0 ? `Image service is busy, retrying (${attempt}/3)...` : 'Generating image...'}
+        </div>
+      )}
+      {status === 'failed' && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 text-center text-xs text-[var(--text-secondary)]">
+          <span>The free image service is busy right now.</span>
+          <button onClick={retry} className="px-3 py-1.5 rounded-lg bg-[var(--primary-color)] text-white font-semibold">Try again</button>
+        </div>
+      )}
+      {status === 'loaded' && (
+        <button
+          onClick={(e) => onDownload(currentSrc, e)}
+          className="absolute top-2 right-2 p-2.5 bg-black/50 text-white rounded-full opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-all hover:bg-[var(--primary-color)]"
+          title="Download image"
+        >
+          <Download size={14} />
+        </button>
+      )}
     </div>
   );
 };
@@ -263,35 +380,59 @@ export default function App() {
     }
   };
 
+  // Browsers load voices asynchronously; without this the first playback falls
+  // back to the default (often robotic) voice.
+  const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
+  const speechRunRef = useRef(0);
+
+  useEffect(() => {
+    if (!('speechSynthesis' in window)) return;
+    const loadVoices = () => { voicesRef.current = window.speechSynthesis.getVoices(); };
+    loadVoices();
+    window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+    return () => {
+      window.speechSynthesis.removeEventListener('voiceschanged', loadVoices);
+      window.speechSynthesis.cancel();
+    };
+  }, []);
+
   const toggleMessageTTS = (messageId: string, text: string) => {
-    if (playingMessageId === messageId) {
-      window.speechSynthesis.cancel();
-      setPlayingMessageId(null);
-    } else {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      
-      // Attempt to load higher quality, more human voices if supported by the browser/OS
-      const voices = window.speechSynthesis.getVoices();
-      const preferredVoices = voices.filter(v => 
-        (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Premium') || v.name.includes('Microsoft')) && 
-        v.lang.startsWith('en')
-      );
-      
-      if (preferredVoices.length > 0) {
-        // Try to favor the UK Google voice or Microsoft Azure Natural voices giving a much more human inflection
-        const bestVoice = preferredVoices.find(v => v.name.includes('UK English Female') || v.name.includes('Aria') || v.name.includes('Natural')) || preferredVoices[0];
-        utterance.voice = bestVoice;
-      }
-
-      utterance.pitch = 1.05; // Make voice slightly more energetic
-      utterance.rate = 1.05;  // Speech pacing
-
-      utterance.onend = () => setPlayingMessageId(null);
-      utterance.onerror = () => setPlayingMessageId(null);
-      setPlayingMessageId(messageId);
-      window.speechSynthesis.speak(utterance);
+    if (!('speechSynthesis' in window)) {
+      alert("Read aloud is not supported by your browser.");
+      return;
     }
+    const synth = window.speechSynthesis;
+    // Each playback gets a number, so events from a cancelled playback
+    // cannot reset the button of the one that replaced it.
+    const run = ++speechRunRef.current;
+    synth.cancel();
+    if (playingMessageId === messageId) {
+      setPlayingMessageId(null);
+      return;
+    }
+
+    const spoken = toSpeechText(text);
+    if (!spoken) return;
+    const lang = detectLanguage(spoken);
+    const voice = pickVoice(voicesRef.current.length ? voicesRef.current : synth.getVoices(), lang);
+    const chunks = splitForSpeech(spoken);
+    const finish = () => { if (speechRunRef.current === run) setPlayingMessageId(null); };
+
+    setPlayingMessageId(messageId);
+    // Chrome sometimes drops speech queued in the same tick as cancel().
+    setTimeout(() => {
+      if (speechRunRef.current !== run) return;
+      chunks.forEach((chunk, i) => {
+        const utterance = new SpeechSynthesisUtterance(chunk);
+        utterance.lang = voice?.lang ?? lang;
+        if (voice) utterance.voice = voice;
+        utterance.rate = 1;
+        utterance.pitch = 1;
+        utterance.onerror = finish;
+        if (i === chunks.length - 1) utterance.onend = finish;
+        synth.speak(utterance);
+      });
+    }, 100);
   };
 
   const handleImageDownload = async (url: string, e: React.MouseEvent) => {
@@ -299,10 +440,12 @@ export default function App() {
     try {
       const response = await fetch(url);
       const blob = await response.blob();
+      if (!response.ok || !blob.type.startsWith('image/')) throw new Error('Not an image');
+      const extension = blob.type === 'image/svg+xml' ? 'svg' : blob.type === 'image/jpeg' ? 'jpg' : blob.type.split('/')[1];
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = blobUrl;
-      a.download = `giscard-ai-image-${Date.now()}.png`;
+      a.download = `giscard-ai-image-${Date.now()}.${extension}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -386,11 +529,13 @@ export default function App() {
     setFileProgress(0);
     const newFiles: AttachedFile[] = [];
     const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+    const MAX_PHOTO_SIZE = 20 * 1024 * 1024; // photos are resized before upload
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      if (file.size > MAX_FILE_SIZE) {
-        alert(`File ${file.name} is too large. Max size is 5MB.`);
+      const isPhoto = file.type.startsWith('image/') && file.type !== 'image/svg+xml';
+      if (file.size > (isPhoto ? MAX_PHOTO_SIZE : MAX_FILE_SIZE)) {
+        alert(`File ${file.name} is too large. Max size is ${isPhoto ? '20' : '5'}MB.`);
         continue;
       }
 
@@ -400,7 +545,7 @@ export default function App() {
           extractedText = await extractTextFromFile(file);
         }
 
-        const base64 = await new Promise<string>((resolve, reject) => {
+        const base64 = isPhoto ? await shrinkImage(file) : await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = (e) => resolve(e.target?.result as string);
           reader.onerror = reject;
@@ -410,7 +555,7 @@ export default function App() {
         newFiles.push({
           name: file.name,
           data: base64.split(',')[1],
-          type: file.type,
+          type: isPhoto ? 'image/jpeg' : file.type,
           extractedText
         });
       } catch (err: any) {
@@ -528,20 +673,28 @@ export default function App() {
     setMessages(prev => [...prev, initialAiMessage]);
     setIsLoading(false);
 
-    // Handle Image Generation via Pollinations.ai instantly
+    // Image generation: Cloudflare through /api/image when the server has
+    // credentials, otherwise the free Pollinations service (retried by GeneratedImage).
     if (isImageGen && imagePrompt.trim() !== '') {
-        const encodedPrompt = encodeURIComponent(imagePrompt + " highly detailed, masterpiece");
-        const seed = Math.floor(Math.random() * 1000000); // randomize
-        const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?seed=${seed}&nologo=True&width=2048&height=2048`;
-        
-        // Immediately render the image box so the browser natively handles the visual loading spinner 
-        // and it stays anchored to current scroll, preventing layout shifts
-        setMessages(prev => prev.map(msg => 
-            msg.id === aiMessageId 
-                ? { ...msg, type: 'image', content: imageUrl, isStreaming: false } 
+        const prompt = `${imagePrompt} highly detailed, masterpiece`;
+        let imageSrc = '';
+        try {
+          const res = await fetch('/api/image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+          });
+          if (res.ok) imageSrc = (await res.json()).image ?? '';
+        } catch {
+          // Fall back to Pollinations below.
+        }
+
+        setMessages(prev => prev.map(msg =>
+            msg.id === aiMessageId
+                ? { ...msg, type: 'image', content: imageSrc || pollinationsUrl(prompt), isStreaming: false }
                 : msg
         ));
-        
+
         return; // Skip LLM generation
     }
 
@@ -567,8 +720,6 @@ export default function App() {
         let fullText = '';
 
         if (currentModel.type === 'gemini') {
-          if (!ai) throw new Error("Gemini API not initialized");
-          
           const geminiHistory = messages.filter(m => !m.isStreaming).map(m => {
              let content = m.content;
              if (m.type === 'file' && m.files) {
@@ -593,7 +744,9 @@ export default function App() {
              }
           });
 
-          const model = ai.getGenerativeModel({ model: currentModel.id, tools: [{ googleSearch: {} }] });
+          // SDK 0.24 types only know the older googleSearchRetrieval tool; Gemini 2.x expects googleSearch.
+          const searchTool = { googleSearch: {} } as unknown as Tool;
+          const model = ai.getGenerativeModel({ model: currentModel.id, tools: [searchTool] }, GEMINI_PROXY);
           const responseStream = await model.generateContentStream({
              contents: [...geminiHistory, { role: 'user', parts: currentParts }],
              systemInstruction: dynamicSystemInstruction,
@@ -639,49 +792,43 @@ export default function App() {
 
           aiMessages.push({ role: 'user', content: currentContent });
 
-          const endpoint = currentModel.type === 'groq' 
-              ? 'https://api.groq.com/openai/v1/chat/completions' 
-              : 'https://openrouter.ai/api/v1/chat/completions';
-              
-          const key = currentModel.type === 'groq' ? getGroqKey() : getOpenRouterKey();
-
-          const response = await fetch(endpoint, {
+          // The server adds the Groq or OpenRouter key (netlify/functions/ai.mts).
+          const response = await fetch('/api/chat', {
             method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${key}`,
-              'Content-Type': 'application/json',
-              'HTTP-Referer': 'https://giscard.me',
-              'X-Title': 'Giscard AI',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+              provider: currentModel.type,
               model: currentModel.id,
               messages: aiMessages,
-              stream: true,
               temperature: 0.5,
             })
           });
 
           if (!response.ok) {
              const errData = await response.json().catch(() => ({}));
-             throw new Error(errData?.error?.message || `${currentModel.type} error: ${response.status}`);
+             throw new Error(`${response.status} ${errData?.error?.message || `${currentModel.type} error`}`);
           }
 
           setIsThinking(false);
           const reader = response.body?.getReader();
           const decoder = new TextDecoder("utf-8");
-          
+
           if (reader) {
+            // Network chunks can end mid-line, so keep the unfinished line for the next read.
+            let buffered = '';
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              
-              const chunk = decoder.decode(value);
-              const lines = chunk.split('\n').filter(line => line.trim() !== '');
-              
+
+              buffered += decoder.decode(value, { stream: true });
+              const lines = buffered.split('\n');
+              buffered = lines.pop() ?? '';
+
               for (const line of lines) {
-                const dataText = line.replace('data: ', '').trim();
+                if (!line.startsWith('data:')) continue;
+                const dataText = line.slice(5).trim();
                 if (dataText === '[DONE]') break;
-                
+
                 try {
                   const data = JSON.parse(dataText);
                   const delta = data.choices[0]?.delta?.content;
@@ -722,7 +869,9 @@ export default function App() {
         setIsThinking(false);
         let errorMsg = 'I encountered an error. This might be due to file size, type, or API quota. Please try again.';
         if (error?.message?.includes('quota') || error?.message?.includes('429')) {
-          errorMsg = '⚠️ **Quota Exceeded (Error 429)**: All available AI models have reached their usage limits on OpenRouter.';
+          errorMsg = '**Too many requests (Error 429)**: the free AI limits are used up for the moment. Wait a minute and try again.';
+        } else if (/413|too large/i.test(error?.message ?? '')) {
+          errorMsg = 'Those attachments are too large to send. Keep the total under 5 MB.';
         }
 
         setMessages(prev => prev.map(msg =>
@@ -811,12 +960,10 @@ export default function App() {
                 <div className={`p-2.5 rounded-xl h-fit shadow-sm ${msg.role === 'user' ? 'bg-[var(--primary-color)] text-white' : 'bg-[var(--bg-secondary)] text-[var(--primary-color)]'}`}>
                   {msg.role === 'user' ? <User size={18} /> : <Bot size={18} />}
                 </div>
-                <div className={`chat-message shadow-sm ${msg.role === 'user' ? 'user-message !bg-gradient-to-br from-[var(--primary-color)] to-[var(--secondary-color)]' : 'ai-message border border-[var(--bg-secondary)]'}`}>
+                {/* min-w-0 lets the bubble shrink: flex items otherwise grow to fit wide content */}
+                <div className={`chat-message min-w-0 shadow-sm ${msg.role === 'user' ? 'user-message !bg-gradient-to-br from-[var(--primary-color)] to-[var(--secondary-color)]' : 'ai-message border border-[var(--bg-secondary)]'}`}>
                   {msg.type === 'image' ? (
-                    <div className="group relative w-full flex justify-center">
-                      <img src={msg.content} alt="AI Generated" className="rounded-xl max-w-full h-auto max-h-[50vh] object-contain shadow-lg transition-transform hover:scale-[1.02]" referrerPolicy="no-referrer" />
-                      <button onClick={(e) => handleImageDownload(msg.content, e)} className="absolute top-2 right-2 p-2.5 bg-black/50 text-white rounded-full opacity-0 group-hover:opacity-100 transition-all hover:bg-[var(--primary-color)] hover:shadow-[0_0_15px_var(--primary-color)]"><Download size={14} /></button>
-                    </div>
+                    <GeneratedImage src={msg.content} onDownload={handleImageDownload} />
                   ) : msg.type === 'file' ? (
                     <div className="flex flex-col gap-2">
                        {msg.content && (

@@ -22,18 +22,21 @@ A high-performance, feature-rich AI chatbot built with **React**, **Vite**, **Go
 2. Configure Build Settings:
    - **Build Command**: `npm run build`
    - **Publish Directory**: `dist`
-3. Add **Environment Variables** (never expose these in code):
-   - `VITE_GEMINI_API_KEY` — from [Google AI Studio](https://aistudio.google.com/)
-   - `VITE_MISTRAL_API_KEY` — from [La Plateforme](https://console.mistral.ai/)
+3. Add **Environment Variables** and tick **Contains secret values** on each:
+   - `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey)
+   - `GROQ_API_KEY` from the [Groq console](https://console.groq.com/keys)
+   - `OPENROUTER_API_KEY` from [OpenRouter](https://openrouter.ai/settings/keys)
+   - Optional, for image generation: `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (a token with the Workers AI permission)
 
-> **Security:** Never commit API keys to your repository. Always use environment variables or a secrets manager.
+> **Security:** The browser never receives these keys. The app calls `/api/*` on its own domain, and the Netlify function in `netlify/functions/ai.mts` adds the key on the server. The function only serves this site, only allows the models the app uses, and limits each visitor to 20 requests a minute. Do not give the variables a `VITE_` prefix: Vite copies those into the public JavaScript.
 
 ### Local Setup
 ```bash
 npm install
-npm run dev      # development
-npm run build    # production build
+npx netlify-cli dev   # runs the site and the /api functions together
+npm run build         # production build
 ```
+Plain `npm run dev` starts only the frontend, so chat requests fail without the functions.
 
 ## Tech Stack
 
@@ -42,7 +45,8 @@ npm run build    # production build
 | Frontend | React 19, TypeScript, Tailwind CSS 4 |
 | Icons | Lucide React |
 | Animations | Framer Motion |
-| AI | `@google/genai`, `@mistralai/mistralai` |
+| AI | Gemini (`@google/generative-ai`), Groq and OpenRouter through a Netlify function |
+| Images | Cloudflare Workers AI (FLUX.1 schnell), Pollinations as fallback |
 | Parsing | `pdfjs-dist`, `mammoth` |
 | Rendering | React-Markdown with GFM |
 
