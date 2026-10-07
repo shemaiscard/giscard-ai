@@ -16,7 +16,7 @@
     "@vitejs/plugin-react": "^5.0.4",
     "docx": "^8.5.0",
     "dotenv": "^17.2.3",
-    "katex": "0.16.47",
+    "katex": "0.18.9",
     "localforage": "^1.10.0",
     "lucide-react": "^0.546.0",
     "mammoth": "^1.8.0",
@@ -38,7 +38,8 @@
     "qs": "^6.16.0",
     "protobufjs": "^7.5.5",
     "ws": "^8.21.0",
-    "image-size": "^2.0.3"
+    "image-size": "^2.0.3",
+    "katex": "$katex"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
