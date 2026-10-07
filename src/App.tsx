@@ -8,7 +8,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, Suspense, lazy } from 'react';
 import localforage from 'localforage';
 import { GoogleGenerativeAI, type Tool } from "@google/generative-ai";
 import {
@@ -49,6 +49,10 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { motion, AnimatePresence } from 'motion/react';
 import { extractTextFromFile } from './utils/fileExtractor';
+import {
+  SHORTCUTS, UPLOAD_OPTIONS, URL_IN_TEXT, docTopicFrom, docTypeFor, languageFromReply,
+  shortcutInstruction, shortcutPlaceholder, withStyle, type ShortcutKind, type ShortcutState,
+} from './shortcuts';
 import { Document, Packer, Paragraph, TextRun } from 'docx';
 import pptxgen from 'pptxgenjs';
 import * as XLSX from 'xlsx';
@@ -85,9 +89,30 @@ const shrinkImage = (file: File, maxSide = 1600): Promise<string> =>
     img.src = url;
   });
 
+// Math answers: common LaTeX read as words ("x^2" -> "x squared"). Inner parts
+// first, so a fraction holding a square root still reads.
+const FRACTION = /\\frac\{([^{}]*)\}\{([^{}]*)\}/g;
+const mathToSpeech = (text: string) =>
+  text
+    .replace(/\\sqrt\{([^{}]*)\}/g, ' the square root of $1 ')
+    .replace(FRACTION, ' $1 over $2 ')
+    .replace(FRACTION, ' $1 over $2 ')
+    .replace(/\^(?:\{2\}|2(?!\d))/g, ' squared ')
+    .replace(/\^(?:\{3\}|3(?!\d))/g, ' cubed ')
+    .replace(/\^\{([^{}]*)\}|\^(\w)/g, ' to the power of $1$2 ')
+    .replace(/\\(?:times|cdot)\b/g, ' times ')
+    .replace(/\\pm\b/g, ' plus or minus ')
+    .replace(/\\(?:leq|le)\b/g, ' less than or equal to ')
+    .replace(/\\(?:geq|ge)\b/g, ' greater than or equal to ')
+    .replace(/\\neq\b/g, ' not equal to ')
+    .replace(/\\approx\b/g, ' approximately ')
+    .replace(/\\(?:left|right|displaystyle|quad|qquad|text|mathrm|boxed)\b|\\[,;!]/g, ' ')
+    .replace(/\\([a-zA-Z]+)/g, ' $1 ')
+    .replace(/[{}$]/g, ' ');
+
 // Read-aloud helpers: speak plain sentences, not Markdown symbols.
-const toSpeechText = (markdown: string) =>
-  markdown
+const toSpeechText = (markdown: string, math = false) =>
+  (math ? mathToSpeech(markdown) : markdown)
     .replace(/```[\s\S]*?```/g, '\nCode block omitted.\n')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
@@ -187,13 +212,21 @@ type OpenAITurn = { role: string; content: string };
 function convertHistoryForProvider(history: Message[], provider: 'gemini'): GeminiTurn[];
 function convertHistoryForProvider(history: Message[], provider: 'openai'): OpenAITurn[];
 function convertHistoryForProvider(history: Message[], provider: 'gemini' | 'openai'): (GeminiTurn | OpenAITurn)[] {
-  // Gemini refuses empty text parts.
-  return history.filter(m => !m.isStreaming && m.content.trim()).map(m => {
-    const content = historyText(m);
-    return provider === 'gemini'
-      ? { role: m.role === 'user' ? 'user' : 'model', parts: [{ text: content }] }
-      : { role: m.role === 'user' ? 'user' : 'assistant', content };
-  });
+  // Gemini refuses empty text parts and expects a conversation that starts with the
+  // user and alternates: opening AI messages (a shortcut's question) are left out, and
+  // neighbouring messages from the same side are joined.
+  const turns: { user: boolean; text: string }[] = [];
+  for (const m of history) {
+    if (m.isStreaming || !m.content.trim()) continue;
+    const user = m.role === 'user';
+    if (!turns.length && !user) continue;
+    const last = turns[turns.length - 1];
+    if (last?.user === user) last.text += `\n\n${historyText(m)}`;
+    else turns.push({ user, text: historyText(m) });
+  }
+  return turns.map(({ user, text }) => provider === 'gemini'
+    ? { role: user ? 'user' : 'model', parts: [{ text }] }
+    : { role: user ? 'user' : 'assistant', content: text });
 }
 
 // Files the browser cannot read (PPTX, XLSX): the model gets the name and type only.
@@ -229,6 +262,8 @@ interface Message {
   timestamp: Date;
   isStreaming?: boolean;
   prompt?: string; // generated pictures: the description they were made from
+  shortcut?: ShortcutKind; // a shortcut's opening question; its options show while that shortcut is open
+  math?: boolean; // Math answers: LaTeX is rendered and read aloud as words
 }
 
 export interface AttachedFile {
@@ -315,6 +350,34 @@ const GeneratedImage = ({ src, onDownload }: { src: string; onDownload: (url: st
   );
 };
 
+// Code blocks get a copy button; inline code is highlighted. Shared by both Markdown renderers.
+const markdownComponents = {
+  code({ node, inline, className, children, ...props }: any) {
+    const match = /language-(\w+)/.exec(className || '');
+    return !inline && match ? (
+      <CodeBlock language={match[1]} {...props}>{String(children).replace(/\n$/, '')}</CodeBlock>
+    ) : (
+      <code className="bg-black/10 dark:bg-white/10 px-1.5 py-0.5 rounded text-[var(--accent-color)] font-mono text-[13px]" {...props}>
+        {children}
+      </code>
+    );
+  },
+};
+
+const MathMarkdown = lazy(() => import('./components/MathMarkdown'));
+
+// Icon and colour of each shortcut; the texts and behaviour are in shortcuts.ts.
+const SHORTCUT_LOOKS: Record<ShortcutKind, { icon: (size: number) => React.ReactNode; color: string }> = {
+  docs: { icon: size => <FileText size={size} />, color: 'var(--primary-color)' },
+  images: { icon: size => <ImageIcon size={size} />, color: 'var(--accent-color)' },
+  code: { icon: size => <Code size={size} />, color: 'var(--secondary-color)' },
+  math: { icon: size => <Calculator size={size} />, color: 'var(--success-color)' },
+  translate: { icon: size => <Languages size={size} />, color: 'var(--warning-color)' },
+  summary: { icon: size => <Maximize2 size={size} />, color: 'var(--primary-color)' },
+};
+const SHORTCUT_KINDS = Object.keys(SHORTCUTS) as ShortcutKind[];
+const DOC_NAMES: Record<string, string> = { word: 'Word document', ppt: 'PowerPoint deck', excel: 'Excel sheet' };
+
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -329,6 +392,8 @@ export default function App() {
   const [isCreateMenuOpen, setIsCreateMenuOpen] = useState(false);
   // Shown when a backup provider answers in a chat that has images (they are not sent to it).
   const [fallbackImageNotice, setFallbackImageNotice] = useState(false);
+  // The open shortcut (Docs, Images, Code, Math, Translate or Summary), if any.
+  const [shortcut, setShortcut] = useState<ShortcutState | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const createMenuRef = useRef<HTMLDivElement>(null);
@@ -536,12 +601,12 @@ export default function App() {
     audio.play().catch(() => resolve(false));
   });
 
-  const toggleMessageTTS = async (messageId: string, text: string) => {
+  const toggleMessageTTS = async (messageId: string, text: string, math = false) => {
     const wasPlaying = playingMessageId === messageId;
     stopSpeech();
     if (wasPlaying) return;
 
-    const spoken = toSpeechText(text);
+    const spoken = toSpeechText(text, math);
     if (!spoken) return;
     const lang = detectLanguage(spoken);
     const chunks = splitForSpeech(spoken);
@@ -649,6 +714,7 @@ export default function App() {
 
   const clearChat = () => {
     setMessages([]);
+    setShortcut(null);
     localforage.removeItem('giscard-ai-chat-history').catch(console.error);
   };
 
@@ -749,8 +815,30 @@ export default function App() {
     ));
   };
 
+  // Shortcuts: a welcome card or the + menu posts the shortcut's question with its
+  // options, and the shortcut shapes each message until it is closed.
+  const startShortcut = (kind: ShortcutKind) => {
+    const id = `${Date.now()}-${kind}`;
+    setMessages(prev => [...prev, { id, role: 'ai', type: 'text', content: SHORTCUTS[kind].question, timestamp: new Date(), shortcut: kind }]);
+    setShortcut({ kind, messageId: id });
+    setIsCreateMenuOpen(false);
+    // On phones, focusing would open the keyboard over the options.
+    if (window.matchMedia('(hover: hover)').matches) inputRef.current?.focus();
+  };
+
+  const pickShortcutOption = (option: string) => {
+    if (!shortcut) return;
+    if (UPLOAD_OPTIONS.has(option)) {
+      fileInputRef.current?.click();
+      return;
+    }
+    setShortcut({ ...shortcut, option: shortcut.option === option ? undefined : option });
+    if (window.matchMedia('(hover: hover)').matches) inputRef.current?.focus();
+  };
+
   const generateResponse = async (userInput: string) => {
     if (!userInput.trim() && attachedFiles.length === 0) return;
+    const mode = shortcut; // the shortcut that was open when this message was sent
     setIsLoading(true);
 
     // Simulate "Upload to AI" progress with a guaranteed minimum visibility
@@ -772,6 +860,15 @@ export default function App() {
     setInput('');
     setAttachedFiles([]);
 
+    // Translate: a reply that only names a language picks it, without asking the model.
+    const language = mode?.kind === 'translate' && !mode.option && !currentFiles.length ? languageFromReply(userInput) : '';
+    if (language) {
+      setShortcut({ ...mode!, option: language });
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: 'ai', type: 'text', content: `Send me the text, and I'll translate it into ${language}.`, timestamp: new Date() }]);
+      setIsLoading(false);
+      return;
+    }
+
     // Dynamic System Instruction with Timezone and Local Time
     const userTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     let dynamicSystemInstruction = `${SYSTEM_INSTRUCTION}\n\n[SYSTEM INFO]\nThe current date and time is: ${new Date().toLocaleString()}, in the timezone: ${userTimeZone}. Use this to accurately calculate global times if asked.`;
@@ -791,6 +888,9 @@ export default function App() {
       isDocGen = true; docType = 'ppt'; docTopic = userInput.substring(26).trim();
     } else if (lowerInput.startsWith('create an excel sheet about ')) {
       isDocGen = true; docType = 'excel'; docTopic = userInput.substring(28).trim();
+    } else if (mode?.kind === 'docs' && !currentFiles.length && userInput.trim()) {
+      // Docs shortcut: the message is the topic; the format is the chosen option or the one it names.
+      isDocGen = true; docType = docTypeFor(mode.option, userInput); docTopic = docTopicFrom(userInput);
     }
 
     if (isDocGen) {
@@ -802,6 +902,10 @@ export default function App() {
          dynamicSystemInstruction += `\n\nThe user requested an Excel sheet about "${docTopic}". Please provide ONLY a valid CSV format table. No markdown tables or code blocks. The first row must be headers, followed by data rows.`;
       }
     }
+
+    const modeInstruction = mode && !isDocGen ? shortcutInstruction(mode) : '';
+    if (modeInstruction) dynamicSystemInstruction += `\n\n[SHORTCUT]\n${modeInstruction}`;
+    const imageStyle = mode?.kind === 'images' ? mode.option : undefined;
 
     // Clear picture requests skip the chat model; for the rest it decides (IMAGE_MARKER).
     const imagePrompt = isDocGen ? '' : imageRequestPrompt(userInput);
@@ -829,12 +933,13 @@ export default function App() {
       type: 'text',
       timestamp: new Date(),
       isStreaming: true,
+      ...(mode?.kind === 'math' ? { math: true } : {}),
     };
     setMessages(prev => [...prev, initialAiMessage]);
     setIsLoading(false);
 
     if (imagePrompt) {
-        await createImage(aiMessageId, imagePrompt);
+        await createImage(aiMessageId, withStyle(imagePrompt, imageStyle));
         return; // Skip LLM generation
     }
 
@@ -881,7 +986,10 @@ export default function App() {
 
           // SDK 0.24 types only know the older googleSearchRetrieval tool; Gemini 2.x expects googleSearch.
           const searchTool = { googleSearch: {} } as unknown as Tool;
-          const model = ai.getGenerativeModel({ model: currentModel.id, tools: [searchTool] }, GEMINI_PROXY);
+          // A link in the message: Gemini reads the page (used by the Summary shortcut, works in any chat).
+          const urlTool = { urlContext: {} } as unknown as Tool;
+          const tools = URL_IN_TEXT.test(userInput) ? [searchTool, urlTool] : [searchTool];
+          const model = ai.getGenerativeModel({ model: currentModel.id, tools }, GEMINI_PROXY);
           const responseStream = await model.generateContentStream({
              contents: [...geminiHistory, { role: 'user', parts: currentParts }],
              systemInstruction: dynamicSystemInstruction,
@@ -973,10 +1081,13 @@ export default function App() {
         const imageMarker = isDocGen ? null : fullText.match(IMAGE_MARKER);
         if (imageMarker) {
            await createImage(aiMessageId, imageMarker[1].slice(0, 500));
+        } else if (mode?.kind === 'images' && !currentFiles.length) {
+           // Images shortcut, but the model answered in words: draw the description as typed.
+           await createImage(aiMessageId, withStyle(userInput.trim(), imageStyle));
         } else if (isDocGen) {
            await handleDocumentGeneration(docType, docTopic, fullText);
            setMessages(prev => prev.map(msg =>
-              msg.id === aiMessageId ? { ...msg, content: `✅ I've created the ${docType.toUpperCase()} file about "${docTopic}". It should download automatically!`, isStreaming: false } : msg
+              msg.id === aiMessageId ? { ...msg, content: `I've created the ${DOC_NAMES[docType]} about "${docTopic}". It should download automatically.`, isStreaming: false } : msg
            ));
         } else {
            setMessages(prev => prev.map(msg =>
@@ -996,6 +1107,12 @@ export default function App() {
         }
 
         setIsThinking(false);
+        if (mode?.kind === 'images' && userInput.trim()) {
+          // No chat model answered: the Images shortcut still draws the description as typed.
+          await createImage(aiMessageId, withStyle(userInput.trim(), imageStyle));
+          success = true;
+          continue;
+        }
         let errorMsg = 'I encountered an error. This might be due to file size, type, or API quota. Please try again.';
         if (error?.message?.includes('quota') || error?.message?.includes('429')) {
           errorMsg = '**Too many requests (Error 429)**: the free AI limits are used up for the moment. Wait a minute and try again.';
@@ -1052,25 +1169,20 @@ export default function App() {
           <div className="flex-1 flex flex-col items-center justify-center overflow-y-auto py-8">
             <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="text-center mb-12">
               <h2 className="text-3xl font-bold mb-2">How can I help you today?</h2>
-              <p className="text-[var(--text-secondary)]">Upload documents, generate art, or just chat.</p>
+              <p className="text-[var(--text-secondary)]">Pick a shortcut, upload a document, or just chat.</p>
             </motion.div>
             <div className="grid grid-cols-3 gap-2 w-full max-w-2xl px-2">
-              {[
-                { icon: <FileText size={18} />, title: "Docs", color: "var(--primary-color)" },
-                { icon: <ImageIcon size={18} />, title: "Images", color: "var(--accent-color)" },
-                { icon: <Code size={18} />, title: "Code", color: "var(--secondary-color)" },
-                { icon: <Calculator size={18} />, title: "Math", color: "var(--success-color)" },
-                { icon: <Languages size={18} />, title: "Translate", color: "var(--warning-color)" },
-                { icon: <Maximize2 size={18} />, title: "Summary", color: "var(--primary-color)" }
-              ].map((item, i) => (
-                <motion.div
-                  key={i}
+              {SHORTCUT_KINDS.map(kind => (
+                <motion.button
+                  key={kind}
+                  type="button"
                   whileHover={{ y: -2 }}
-                  className="info-card !m-0 flex flex-col items-center justify-center text-center gap-1 p-2 cursor-pointer hover:border-[var(--primary-color)] border border-transparent transition-all rounded-xl"
+                  onClick={() => startShortcut(kind)}
+                  className="info-card !m-0 flex flex-col items-center justify-center text-center gap-1 p-2 cursor-pointer hover:border-[var(--primary-color)] focus-visible:border-[var(--primary-color)] focus-visible:outline-none border border-transparent transition-all rounded-xl text-[var(--text-primary)]"
                 >
-                  <div style={{ color: item.color }} className="mb-0.5">{item.icon}</div>
-                  <h3 className="font-bold text-[10px] md:text-xs leading-none">{item.title}</h3>
-                </motion.div>
+                  <span style={{ color: SHORTCUT_LOOKS[kind].color }} className="mb-0.5">{SHORTCUT_LOOKS[kind].icon(18)}</span>
+                  <span className="font-bold text-[10px] md:text-xs leading-none">{SHORTCUTS[kind].title}</span>
+                </motion.button>
               ))}
             </div>
           </div>
@@ -1119,23 +1231,15 @@ export default function App() {
                   ) : (
                     <div className="prose dark:prose-invert max-w-none leading-relaxed text-sm md:text-base">
                       {msg.content ? (
-                          <ReactMarkdown 
-                            remarkPlugins={[remarkGfm]}
-                            components={{
-                              code({ node, inline, className, children, ...props }: any) {
-                                const match = /language-(\w+)/.exec(className || '');
-                                return !inline && match ? (
-                                  <CodeBlock language={match[1]} {...props}>{String(children).replace(/\n$/, '')}</CodeBlock>
-                                ) : (
-                                  <code className="bg-black/10 dark:bg-white/10 px-1.5 py-0.5 rounded text-[var(--accent-color)] font-mono text-[13px]" {...props}>
-                                    {children}
-                                  </code>
-                                );
-                              }
-                            }}
-                          >
-                            {msg.content}
-                          </ReactMarkdown>
+                          msg.math ? (
+                            <Suspense fallback={<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{msg.content}</ReactMarkdown>}>
+                              <MathMarkdown components={markdownComponents}>{msg.content}</MathMarkdown>
+                            </Suspense>
+                          ) : (
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                              {msg.content}
+                            </ReactMarkdown>
+                          )
                       ) : msg.isStreaming ? (
                           <div className="flex items-center gap-3">
                              <BrainCircuit size={18} className="animate-pulse text-[var(--primary-color)]" />
@@ -1149,6 +1253,26 @@ export default function App() {
                              </div>
                           </div>
                       ) : null}
+                      {msg.shortcut && shortcut?.messageId === msg.id && (
+                        <div className="not-prose flex flex-wrap gap-2 mt-3" role="group" aria-label={`${SHORTCUTS[msg.shortcut].title} options`}>
+                          {SHORTCUTS[msg.shortcut].options.map(option => {
+                            const upload = UPLOAD_OPTIONS.has(option);
+                            const chosen = !upload && shortcut.option === option;
+                            return (
+                              <button
+                                key={option}
+                                type="button"
+                                onClick={() => pickShortcutOption(option)}
+                                aria-pressed={upload ? undefined : chosen}
+                                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-semibold transition-colors ${chosen ? 'bg-[var(--primary-color)] border-[var(--primary-color)] text-white' : 'border-[var(--text-secondary)]/40 text-[var(--text-primary)] hover:border-[var(--primary-color)]'}`}
+                              >
+                                {upload && <Paperclip size={12} />}
+                                {option}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   )}
                   <div className={`flex items-center justify-between mt-2 pt-2 border-t border-white/5 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
@@ -1157,7 +1281,7 @@ export default function App() {
                     </div>
                     {msg.role === 'ai' && !msg.isStreaming && msg.type === 'text' && (
                       <button 
-                        onClick={() => toggleMessageTTS(msg.id, msg.content)}
+                        onClick={() => toggleMessageTTS(msg.id, msg.content, msg.math)}
                         className="p-1 hover:bg-[var(--bg-secondary)] rounded transition-colors text-[var(--text-secondary)] opacity-50 hover:opacity-100"
                         title="Read aloud"
                       >
@@ -1228,6 +1352,17 @@ export default function App() {
               ))}
             </motion.div>
           )}
+          {shortcut && (
+            <div className="flex items-center gap-2 mb-2 px-1">
+              <span className="inline-flex items-center gap-1.5 pl-2.5 pr-1 py-1 rounded-full bg-[var(--bg-secondary)] border border-[var(--primary-color)] text-xs font-semibold text-[var(--text-primary)]">
+                <span style={{ color: SHORTCUT_LOOKS[shortcut.kind].color }}>{SHORTCUT_LOOKS[shortcut.kind].icon(14)}</span>
+                {SHORTCUTS[shortcut.kind].title}{shortcut.option ? `: ${shortcut.option}` : ''}
+                <button type="button" onClick={() => setShortcut(null)} className="p-1 rounded-full hover:bg-black/10 dark:hover:bg-white/10" aria-label={`Close the ${SHORTCUTS[shortcut.kind].title} shortcut`} title="Close shortcut">
+                  <X size={12} />
+                </button>
+              </span>
+            </div>
+          )}
           <form onSubmit={handleSubmit} className="flex flex-wrap md:flex-nowrap gap-1 md:gap-2 items-end bg-[var(--bg-secondary)] p-2 rounded-2xl border-2 border-transparent focus-within:border-[var(--primary-color)] transition-all">
             <button
               type="button"
@@ -1252,6 +1387,17 @@ export default function App() {
                    <button type="button" onClick={() => { setInput("Create an Excel sheet about "); setIsCreateMenuOpen(false); }} className="w-full text-left px-4 py-2 hover:bg-[var(--bg-secondary)] flex items-center gap-2 text-sm transition-colors cursor-pointer"><Table size={16} className="text-green-500"/> Excel Sheet</button>
                    <button type="button" onClick={() => { setInput("generate an image of "); setIsCreateMenuOpen(false); }} className="w-full text-left px-4 py-2 hover:bg-[var(--bg-secondary)] flex items-center gap-2 text-sm transition-colors cursor-pointer"><ImageIcon size={16} className="text-purple-500"/> Generate Image</button>
                    <button type="button" onClick={() => { setInput("Create a quiz about "); setIsCreateMenuOpen(false); }} className="w-full text-left px-4 py-2 hover:bg-[var(--bg-secondary)] flex items-center gap-2 text-sm transition-colors cursor-pointer"><Brain size={16} className="text-pink-500"/> Quiz / Flashcards</button>
+                   <div className="mt-1 pt-2 px-3 border-t border-[var(--bg-secondary)]">
+                     <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-secondary)] mb-1.5">Shortcuts</p>
+                     <div className="grid grid-cols-3 gap-1">
+                       {SHORTCUT_KINDS.map(kind => (
+                         <button key={kind} type="button" onClick={() => startShortcut(kind)} className="flex flex-col items-center gap-1 py-2 rounded-lg hover:bg-[var(--bg-secondary)] text-[10px] font-semibold transition-colors cursor-pointer">
+                           <span style={{ color: SHORTCUT_LOOKS[kind].color }}>{SHORTCUT_LOOKS[kind].icon(16)}</span>
+                           {SHORTCUTS[kind].title}
+                         </button>
+                       ))}
+                     </div>
+                   </div>
                 </div>
               )}
             </div>
@@ -1282,7 +1428,7 @@ export default function App() {
                   handleSubmit(e);
                 }
               }}
-              placeholder="Message..."
+              placeholder={shortcut ? shortcutPlaceholder(shortcut) : 'Message...'}
               disabled={isLoading}
               rows={1}
               className="order-first md:order-none basis-full md:basis-0 grow min-w-0 bg-transparent border-none outline-none focus:ring-0 px-2 py-2 md:p-3 text-base md:text-sm resize-none max-h-32 overflow-y-auto"
