@@ -8,7 +8,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import localforage from 'localforage';
 import { GoogleGenerativeAI, type Tool } from "@google/generative-ai";
 import {
@@ -103,20 +103,36 @@ const toSpeechText = (markdown: string) =>
     .replace(/\s+/g, ' ')
     .trim();
 
-// Short chunks avoid Chrome cutting off long utterances after about 15 seconds.
-const splitForSpeech = (text: string, maxLength = 220) => {
+// Parts of at most maxLength characters. Orpheus refuses more than 200 per request,
+// and a refused part used to hand the rest of the reply to the browser voice.
+// Cut at sentence ends first, then at commas, semicolons or colons, then between words.
+const SPEECH_BREAKS = [/[^.!?]+[.!?]*\s*/g, /[^,;:]+[,;:]*\s*/g, /\S+\s*/g];
+const splitForSpeech = (text: string, maxLength = 190) => {
+  const pieces: string[] = [];
+  const cut = (piece: string, level: number) => {
+    if (piece.length <= maxLength) pieces.push(piece);
+    else if (level < SPEECH_BREAKS.length) (piece.match(SPEECH_BREAKS[level]) ?? [piece]).forEach(p => cut(p, level + 1));
+    else for (let i = 0; i < piece.length; i += maxLength) pieces.push(piece.slice(i, i + maxLength));
+  };
+  cut(text, 0);
   const chunks: string[] = [];
   let current = '';
-  for (const sentence of text.match(/[^.!?]+[.!?]*\s*/g) ?? [text]) {
-    if (current && (current + sentence).length > maxLength) {
+  for (const piece of pieces) {
+    if (current && (current + piece).length > maxLength) {
       chunks.push(current.trim());
       current = '';
     }
-    current += sentence;
+    current += piece;
   }
   if (current.trim()) chunks.push(current.trim());
-  return chunks;
+  return chunks.filter(Boolean);
 };
+
+// Orpheus's free tier reads about 1,200 characters a minute and 3,600 a day, so a
+// longer reply would change voice halfway. MeloTTS reads such replies from the start.
+const ORPHEUS_REPLY_CHARS = 1000;
+// Languages /api/tts can voice (Orpheus or MeloTTS); the browser voice reads the others.
+const SERVER_VOICE_LANGS = new Set(['en', 'es', 'fr', 'zh', 'ja', 'ko']);
 
 const detectLanguage = (text: string) =>
   /[가-힯]/.test(text) ? 'ko'
@@ -136,17 +152,44 @@ const pickVoice = (voices: SpeechSynthesisVoice[], lang: string) => {
   return preferred.find(v => /UK English Female|Aria|Natural/.test(v.name)) ?? preferred[0] ?? sameLang[0];
 };
 
+// Pictures: clear requests ("generate an image of a fox", "draw a fox") go straight
+// to the image service. Other wording and follow-ups ("a dog too", "make it blue")
+// reach the chat model, which answers with one IMAGE_MARKER line to ask for a picture.
+const IMAGE_MARKER = /\[\[IMAGE:\s*([^\]]+?)\s*\]\]/i;
+const IMAGE_REQUEST = /^(?:(?:please|can you|could you)\s+)?(?:(?:generate|create|make|show)\s+(?:me\s+)?(?:(?:an?|the|some)\s+)?(?:[\w-]+\s+){0,2}?(?:image|picture|photo|drawing|painting|illustration)s?(?:\s+(?:of|showing|with|about)\b|\s*[.!?]?\s*$)|(?:draw|paint|sketch)\s+(?:me\s+)?(?:an?|the|some)\s+)/i;
+
+// The picture description in a clear request, or '' when the chat model should decide.
+const imageRequestPrompt = (input: string) => {
+  const text = input.trim();
+  if (!IMAGE_REQUEST.test(text) || /\bavatars?\b/i.test(text)) return '';
+  const prompt = text.replace(IMAGE_REQUEST, '').replace(/[\s.!?]+$/, '')
+    || text.replace(/^(?:(?:please|can you|could you)\s+)?(?:generate|create|make|show)\s+(?:me\s+)?/i, '')
+      .replace(/\b(?:image|picture|photo)s?\b/gi, '').replace(/[\s.!?]+$/, '');
+  return /[a-z]{3}/i.test(prompt.replace(/\b(?:an?|the|some)\b/gi, '')) ? prompt.trim() : '';
+};
+
+// While a reply streams, an image request line (whole or still arriving) stays hidden.
+const hideImageMarker = (text: string) =>
+  text.replace(/\[\[IMAGE:[^\]]*(?:\]\]?)?/gi, '').replace(/\[(?:\[(?:I(?:M(?:A(?:G(?:E)?)?)?)?)?)?$/i, '');
+
 // Chat history in each provider's format (paper Section III.F): Gemini uses
 // {role, parts}, OpenRouter and Groq use OpenAI-style {role, content}.
+// Image data never goes back to the model (it used to answer with fake image text):
+// a picture made here appears as the IMAGE_MARKER line it came from.
+const DATA_IMAGE = /data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/g;
+const historyText = (m: Message) => {
+  if (m.type === 'image') return m.prompt ? `[[IMAGE: ${m.prompt}]]` : '[An image was shown to the user.]';
+  const text = /^\s*data:image\//.test(m.content) ? '[image data removed]' : m.content.replace(DATA_IMAGE, '[image data removed]');
+  return m.type === 'file' && m.files ? `[Attached Files: ${m.files.map(f => f.name).join(', ')}]\n${text}` : text;
+};
 type GeminiTurn = { role: string; parts: { text: string }[] };
 type OpenAITurn = { role: string; content: string };
 function convertHistoryForProvider(history: Message[], provider: 'gemini'): GeminiTurn[];
 function convertHistoryForProvider(history: Message[], provider: 'openai'): OpenAITurn[];
 function convertHistoryForProvider(history: Message[], provider: 'gemini' | 'openai'): (GeminiTurn | OpenAITurn)[] {
-  return history.filter(m => !m.isStreaming).map(m => {
-    const content = m.type === 'file' && m.files
-      ? `[Attached Files: ${m.files.map(f => f.name).join(', ')}]\n${m.content}`
-      : m.content;
+  // Gemini refuses empty text parts.
+  return history.filter(m => !m.isStreaming && m.content.trim()).map(m => {
+    const content = historyText(m);
     return provider === 'gemini'
       ? { role: m.role === 'user' ? 'user' : 'model', parts: [{ text: content }] }
       : { role: m.role === 'user' ? 'user' : 'assistant', content };
@@ -171,7 +214,11 @@ const SYSTEM_INSTRUCTION = `You are Giscard AI, a highly capable and intelligent
 
 If the user specifically asks who you are or who created you, answer briefly: "I am Giscard AI, created by Shema Nkindi Giscard." Do NOT mention your creator unless specifically asked about it. Do NOT mention any underlying AI model names (such as Gemini, Mistral, GPT, etc.) under any circumstances.
 
-Provide concise, summarized, and clear responses. Keep your answers brief but informative, avoiding unnecessary long text unless explicitly asked for a detailed explanation. When asked for code, ensure it is robust and clean. When asked for icons/graphics, generate pure, valid SVG code. Always be helpful and articulate.`;
+Provide concise, summarized, and clear responses. Keep your answers brief but informative, avoiding unnecessary long text unless explicitly asked for a detailed explanation. When asked for code, ensure it is robust and clean. When asked for icons/graphics, generate pure, valid SVG code. Always be helpful and articulate.
+
+You can also create pictures. When the user asks for a picture, photo, drawing, painting or illustration, including follow-ups such as "a dog too", "another one" or "make it blue", reply with only this line and nothing else:
+[[IMAGE: a complete English description of the picture]]
+The app turns that line into the picture. Never write image data, base64 text or Markdown images yourself.`;
 
 interface Message {
   id: string;
@@ -181,6 +228,7 @@ interface Message {
   files?: { name: string, type: string }[];
   timestamp: Date;
   isStreaming?: boolean;
+  prompt?: string; // generated pictures: the description they were made from
 }
 
 export interface AttachedFile {
@@ -284,6 +332,16 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const createMenuRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // The message box grows with its text up to 128 px and shrinks back when the text
+  // is sent or replaced (typing, dictation and the create menu all change input).
+  useLayoutEffect(() => {
+    const box = inputRef.current;
+    if (!box) return;
+    box.style.height = 'auto';
+    box.style.height = `${Math.min(box.scrollHeight, 128)}px`;
+  }, [input]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -450,20 +508,24 @@ export default function App() {
     }, 100);
   };
 
-  // One part of a reply as speech from the server, or null when no voice service answers.
+  // One part of a reply as speech from the server, or null when no voice service
+  // answers. A failed part is asked for once more before the browser voice takes over.
   const fetchVoice = async (text: string, lang: string, engine: string | undefined, signal: AbortSignal) => {
-    try {
-      const res = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, lang, engine }),
-        signal,
-      });
-      if (!res.ok) return null;
-      return { url: URL.createObjectURL(await res.blob()), engine: res.headers.get('X-TTS-Engine') ?? undefined };
-    } catch {
-      return null;
+    for (let attempt = 0; attempt < 2 && !signal.aborted; attempt++) {
+      if (attempt) await new Promise(resolve => setTimeout(resolve, 800));
+      try {
+        const res = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, lang, engine }),
+          signal,
+        });
+        if (res.ok) return { url: URL.createObjectURL(await res.blob()), engine: res.headers.get('X-TTS-Engine') ?? undefined };
+      } catch {
+        // Network error or cancelled playback: the loop condition decides.
+      }
     }
+    return null;
   };
 
   const playAudio = (audio: HTMLAudioElement, url: string, signal: AbortSignal) => new Promise<boolean>(resolve => {
@@ -482,11 +544,15 @@ export default function App() {
     const spoken = toSpeechText(text);
     if (!spoken) return;
     const lang = detectLanguage(spoken);
-    const chunks = splitForSpeech(spoken, 190); // Orpheus takes up to 200 characters per request
+    const chunks = splitForSpeech(spoken);
     const run = speechRunRef.current;
     const controller = new AbortController();
     speechAbortRef.current = controller;
     setPlayingMessageId(messageId);
+    if (!SERVER_VOICE_LANGS.has(lang)) {
+      speakWithBrowserVoice(chunks, lang, run);
+      return;
+    }
 
     // Start audio inside the tap, so phones allow the voice that arrives a moment later.
     const audio = audioRef.current ?? new Audio();
@@ -494,7 +560,7 @@ export default function App() {
     audio.src = SILENT_WAV;
     audio.play().catch(() => {});
 
-    let engine: string | undefined;
+    let engine: string | undefined = spoken.length > ORPHEUS_REPLY_CHARS ? 'melotts' : undefined;
     let next = fetchVoice(chunks[0], lang, engine, controller.signal);
     for (let i = 0; i < chunks.length; i++) {
       const voice = await next;
@@ -657,6 +723,32 @@ export default function App() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  // Cloudflare Workers AI through /api/image (no watermark); the picture replaces the reply.
+  const createImage = async (messageId: string, description: string) => {
+    let imageSrc = '';
+    let failure = 'Image generation failed. Please try again.';
+    try {
+      const res = await fetch('/api/image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: `${description}, highly detailed, masterpiece` }),
+      });
+      if (res.ok) imageSrc = (await res.json()).image ?? '';
+      else if (res.status === 429) failure = "**Today's free image limit is reached.** Try again tomorrow.";
+      else if (res.status === 503) failure = 'The image service is busy right now. Try again in a minute.';
+    } catch {
+      // Network error: keep the generic failure message.
+    }
+
+    setMessages(prev => prev.map(msg =>
+      msg.id === messageId
+        ? (imageSrc
+            ? { ...msg, type: 'image', content: imageSrc, prompt: description, isStreaming: false }
+            : { ...msg, content: failure, isStreaming: false })
+        : msg
+    ));
+  };
+
   const generateResponse = async (userInput: string) => {
     if (!userInput.trim() && attachedFiles.length === 0) return;
     setIsLoading(true);
@@ -685,7 +777,7 @@ export default function App() {
     let dynamicSystemInstruction = `${SYSTEM_INSTRUCTION}\n\n[SYSTEM INFO]\nThe current date and time is: ${new Date().toLocaleString()}, in the timezone: ${userTimeZone}. Use this to accurately calculate global times if asked.`;
 
     if (userInput.toLowerCase().includes('creator') || userInput.toLowerCase().includes('who made you') || userInput.toLowerCase().includes('who created you') || userInput.toLowerCase().includes('who are you')) {
-       dynamicSystemInstruction += `\n\n[CREATOR BACKGROUND]: Shema Nkindi Giscard is a versatile full-stack software developer based in Seoul, Korea, with expertise in web development (Python, React, Flask, Django), computer graphics (Blender, OpenGL), cybersecurity (cryptography, network recon), and AI/ML. Projects: Ze Video Downloader, Ze Matrix, Cipher Shield Suite, LogoScope. Portfolio: https://www.giscard.me`;
+       dynamicSystemInstruction += `\n\n[CREATOR BACKGROUND]: Shema Nkindi Giscard is an M.S. Computer Science student at Kennesaw State University and a versatile full-stack software developer with expertise in web development (Python, React, Flask, Django), computer graphics (Blender, OpenGL), cybersecurity (cryptography, network recon), and AI/ML. Projects: Ze Video Downloader, Ze Matrix, Cipher Shield Suite, LogoScope. Portfolio: https://www.giscard.me`;
     }
 
     let isDocGen = false;
@@ -711,26 +803,8 @@ export default function App() {
       }
     }
 
-    // Check for image generation request using robust regex
-    const imageMatch = lowerInput.match(/^(?:generate|create|make|draw|imagine|show me)(?: me)?(?: an?)?\s+(.*(?:image|picture|photo|drawing).*)/i) 
-                    || lowerInput.match(/^(?:generate|create|make|draw|imagine|show me)(?: me)?(?: an?)?\s+(.*)/i);
-    
-    let isImageGen = false;
-    let imagePrompt = '';
-    
-    // If it mentions image/drawing/picture AND an action verb, or starts with draw/imagine
-    if ((lowerInput.includes('generate') || lowerInput.includes('create') || lowerInput.includes('draw') || lowerInput.includes('imagine')) && 
-        (lowerInput.includes('image') || lowerInput.includes('picture') || lowerInput.includes('photo') || lowerInput.startsWith('draw') || lowerInput.startsWith('imagine'))) {
-        
-        // Prevent avatar requests from being caught here
-        if (!lowerInput.includes('avatar')) {
-            isImageGen = true;
-            imagePrompt = lowerInput
-                .replace(/^(generate|create|make|draw|imagine|show me)(\s+me)?(\s+an?)?\s+/i, '')
-                .replace(/\b(image|picture|photo)s?\b/gi, '')
-                .trim() || userInput;
-        }
-    }
+    // Clear picture requests skip the chat model; for the rest it decides (IMAGE_MARKER).
+    const imagePrompt = isDocGen ? '' : imageRequestPrompt(userInput);
 
     // Check for avatar generation request
     let isAvatarGen = false;
@@ -759,31 +833,8 @@ export default function App() {
     setMessages(prev => [...prev, initialAiMessage]);
     setIsLoading(false);
 
-    // Image generation: Cloudflare Workers AI through /api/image (no watermark).
-    if (isImageGen && imagePrompt.trim() !== '') {
-        const prompt = `${imagePrompt} highly detailed, masterpiece`;
-        let imageSrc = '';
-        let failure = 'Image generation failed. Please try again.';
-        try {
-          const res = await fetch('/api/image', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt }),
-          });
-          if (res.ok) imageSrc = (await res.json()).image ?? '';
-          else if (res.status === 429) failure = "**Today's free image limit is reached.** Try again tomorrow.";
-        } catch {
-          // Network error: keep the generic failure message.
-        }
-
-        setMessages(prev => prev.map(msg =>
-            msg.id === aiMessageId
-                ? (imageSrc
-                    ? { ...msg, type: 'image', content: imageSrc, isStreaming: false }
-                    : { ...msg, content: failure, isStreaming: false })
-                : msg
-        ));
-
+    if (imagePrompt) {
+        await createImage(aiMessageId, imagePrompt);
         return; // Skip LLM generation
     }
 
@@ -842,7 +893,7 @@ export default function App() {
              if (chunkText) {
                 fullText += chunkText;
                 setMessages(prev => prev.map(msg =>
-                   msg.id === aiMessageId ? { ...msg, content: fullText } : msg
+                   msg.id === aiMessageId ? { ...msg, content: hideImageMarker(fullText) } : msg
                 ));
              }
           }
@@ -908,7 +959,7 @@ export default function App() {
                   if (delta) {
                     fullText += delta;
                     setMessages(prev => prev.map(msg =>
-                      msg.id === aiMessageId ? { ...msg, content: fullText } : msg
+                      msg.id === aiMessageId ? { ...msg, content: hideImageMarker(fullText) } : msg
                     ));
                   }
                 } catch (e) {
@@ -919,14 +970,17 @@ export default function App() {
           }
         }
 
-        if (isDocGen) {
+        const imageMarker = isDocGen ? null : fullText.match(IMAGE_MARKER);
+        if (imageMarker) {
+           await createImage(aiMessageId, imageMarker[1].slice(0, 500));
+        } else if (isDocGen) {
            await handleDocumentGeneration(docType, docTopic, fullText);
            setMessages(prev => prev.map(msg =>
               msg.id === aiMessageId ? { ...msg, content: `✅ I've created the ${docType.toUpperCase()} file about "${docTopic}". It should download automatically!`, isStreaming: false } : msg
            ));
         } else {
            setMessages(prev => prev.map(msg =>
-             msg.id === aiMessageId ? { ...msg, isStreaming: false } : msg
+             msg.id === aiMessageId ? { ...msg, content: fullText, isStreaming: false } : msg
            ));
         }
         const sessionHasImages = [...messages.flatMap(m => m.files ?? []), ...currentFiles].some(f => f.type.startsWith('image/'));
@@ -1174,7 +1228,7 @@ export default function App() {
               ))}
             </motion.div>
           )}
-          <form onSubmit={handleSubmit} className="flex gap-2 items-end bg-[var(--bg-secondary)] p-2 rounded-2xl border-2 border-transparent focus-within:border-[var(--primary-color)] transition-all">
+          <form onSubmit={handleSubmit} className="flex flex-wrap md:flex-nowrap gap-1 md:gap-2 items-end bg-[var(--bg-secondary)] p-2 rounded-2xl border-2 border-transparent focus-within:border-[var(--primary-color)] transition-all">
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
@@ -1217,14 +1271,11 @@ export default function App() {
               multiple
               accept=".pdf,.docx,.pptx,.xlsx,.txt,.csv,.md,.png,.jpg,.jpeg,.svg"
             />
+            {/* Phones: the text gets a full-width row above the buttons. */}
             <textarea
+              ref={inputRef}
               value={input}
-              onChange={(e) => {
-                setInput(e.target.value);
-                // Auto-resize textarea
-                e.target.style.height = 'auto';
-                e.target.style.height = Math.min(e.target.scrollHeight, 128) + 'px';
-              }}
+              onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
@@ -1234,12 +1285,12 @@ export default function App() {
               placeholder="Message..."
               disabled={isLoading}
               rows={1}
-              className="flex-1 bg-transparent border-none focus:ring-0 p-3 text-sm resize-none max-h-32 overflow-y-auto"
+              className="order-first md:order-none basis-full md:basis-0 grow min-w-0 bg-transparent border-none outline-none focus:ring-0 px-2 py-2 md:p-3 text-base md:text-sm resize-none max-h-32 overflow-y-auto"
             />
             <button
               type="submit"
               disabled={(!input.trim() && attachedFiles.length === 0) || isLoading}
-              className="p-3 bg-[var(--primary-color)] text-white rounded-xl hover:scale-105 active:scale-95 transition-all disabled:opacity-20 disabled:scale-100"
+              className="ml-auto md:ml-0 p-3 bg-[var(--primary-color)] text-white rounded-xl hover:scale-105 active:scale-95 transition-all disabled:opacity-20 disabled:scale-100"
             >
               <Send size={20} />
             </button>
