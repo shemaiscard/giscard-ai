@@ -9,7 +9,8 @@
  */
 
 const MAX_CHARS = 200; // Orpheus accepts up to 200 characters per request
-const MELO_LANGS = ['en', 'es', 'fr', 'zh', 'ja', 'ko'];
+// MeloTTS names Japanese and Korean "jp" and "kr" instead of the usual "ja" and "ko".
+const MELO_LANG: Record<string, string> = { en: 'en', es: 'es', fr: 'fr', zh: 'zh', ja: 'jp', ko: 'kr' };
 
 const json = (status: number, message: string) =>
   new Response(JSON.stringify({ error: { message } }), {
@@ -74,11 +75,12 @@ const orpheus = async (text: string) => {
 const melotts = async (text: string, lang: string) => {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID;
   const token = process.env.CLOUDFLARE_API_TOKEN;
-  if (!account || !token || !MELO_LANGS.includes(lang)) return null;
+  const meloLang = MELO_LANG[lang];
+  if (!account || !token || !meloLang) return null;
   const upstream = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/myshell-ai/melotts`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ prompt: text, lang }),
+    body: JSON.stringify({ prompt: text, lang: meloLang }),
   });
   const data = await upstream.json().catch(() => null);
   const encoded = data?.result?.audio;
