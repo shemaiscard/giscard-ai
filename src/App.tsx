@@ -818,6 +818,13 @@ export default function App() {
   // Shortcuts: a welcome card or the + menu posts the shortcut's question with its
   // options, and the shortcut shapes each message until it is closed.
   const startShortcut = (kind: ShortcutKind) => {
+    if (kind === 'math') {
+      // KaTeX hides math until its fonts arrive (font-display: block), so fetch the
+      // renderer and its two main fonts while the user types the problem.
+      import('./components/MathMarkdown')
+        .then(() => Promise.all([document.fonts.load('1em KaTeX_Main'), document.fonts.load('italic 1em KaTeX_Math')]))
+        .catch(() => {});
+    }
     const id = `${Date.now()}-${kind}`;
     setMessages(prev => [...prev, { id, role: 'ai', type: 'text', content: SHORTCUTS[kind].question, timestamp: new Date(), shortcut: kind }]);
     setShortcut({ kind, messageId: id });
