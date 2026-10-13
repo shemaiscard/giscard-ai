@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import * as pdfjsLib from 'pdfjs-dist';
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { extractTextFromFile } from './fileExtractor';
 
@@ -11,7 +11,7 @@ const fixture = (name: string, type: string) =>
 
 beforeAll(() => {
   // The app loads the PDF worker from unpkg. The tests use the copy in node_modules, so they run offline.
-  const worker = createRequire(import.meta.url).resolve('pdfjs-dist/build/pdf.worker.mjs');
+  const worker = createRequire(import.meta.url).resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
   pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(worker).href;
 });
 
