@@ -28,7 +28,7 @@ const isSameSite = (origin: string | null, host: string) => {
   }
 };
 
-const audio = (bytes: Uint8Array, engine: string) =>
+const audio = (bytes: Uint8Array<ArrayBuffer>, engine: string) =>
   new Response(bytes, {
     headers: {
       'content-type': 'audio/wav',
@@ -40,7 +40,7 @@ const audio = (bytes: Uint8Array, engine: string) =>
 
 // Orpheus streams WAV with placeholder sizes (0xFFFFFFFF); write the real sizes
 // so every browser can play the file.
-const fixWavSizes = (bytes: Uint8Array) => {
+const fixWavSizes = (bytes: Uint8Array<ArrayBuffer>) => {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (bytes.byteLength < 44 || view.getUint32(0, false) !== 0x52494646) return bytes; // "RIFF"
   view.setUint32(4, bytes.byteLength - 8, true);
