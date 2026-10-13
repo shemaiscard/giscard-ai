@@ -1,9 +1,11 @@
-import * as pdfjsLib from 'pdfjs-dist';
+// The legacy build adds the newest JavaScript features (Promise.try and others) only when a
+// browser lacks them, so PDF upload keeps working on older phones and browsers.
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 // @ts-ignore
 import * as mammoth from 'mammoth';
 
 // Set up PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjsLib.version}/legacy/build/pdf.worker.min.mjs`;
 
 export const extractTextFromFile = async (file: File): Promise<string> => {
   const extension = file.name.split('.').pop()?.toLowerCase();

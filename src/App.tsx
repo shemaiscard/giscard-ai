@@ -48,7 +48,6 @@ import {
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { motion, AnimatePresence } from 'motion/react';
-import { extractTextFromFile } from './utils/fileExtractor';
 import {
   SHORTCUTS, UPLOAD_OPTIONS, URL_IN_TEXT, docTopicFrom, docTypeFor, languageFromReply,
   shortcutInstruction, shortcutPlaceholder, withStyle, type ShortcutKind, type ShortcutState,
@@ -760,6 +759,8 @@ export default function App() {
       try {
         let extractedText = undefined;
         if (!file.type.startsWith('image/')) {
+          // Loaded on the first upload, so pdf.js and mammoth stay out of the first page load.
+          const { extractTextFromFile } = await import('./utils/fileExtractor');
           extractedText = await extractTextFromFile(file);
         }
 

@@ -23,7 +23,7 @@
     "mammoth": "^1.8.0",
     "motion": "^12.23.24",
     "nanoid": "^6.0.2",
-    "pdfjs-dist": "^4.1.392",
+    "pdfjs-dist": "^6.4.299",
     "postcss": "^8.5.29",
     "pptxgenjs": "^4.0.1",
     "react": "^19.3.0",
